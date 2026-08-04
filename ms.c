@@ -1,0 +1,2432 @@
+/*
+ * Machdyne Scheme
+ * Copyright (c) 2026 Lone Dynamics Corporation. All rights reserved.
+ *
+ * Redistribution and use in source, binary or physical forms, with or
+ * without modification, is permitted provided that the following condition
+ * is met:
+ *
+ * Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimer.
+ *
+ * THIS HARDWARE, SOFTWARE, DATA AND/OR DOCUMENTATION ("THE ASSETS") IS
+ * PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+ * OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE ASSETS OR THE USE OR OTHER
+ * DEALINGS IN THE ASSETS. USE AT YOUR OWN RISK.
+ *
+ * Originally forked from the LIX version of "Lone Lisp". Renamed due to
+ * a more popular project with the same name that came along later.
+ *
+ * This revision: fixes broken GC, adds proper tail calls, and targets very
+ * small memory footprints (a static cell pool, no fopen()/file I/O when
+ * built with -DLIX).
+ *
+ * Build (desktop):
+ *   $ gcc -DMS_HOST -o ms ms.c -lm
+ *   $ ./ms
+ *   ms> (load "ms_stdlib.l")
+ *
+ * Build (embedded / LIX, no file I/O, tiny heap):
+ *   $ gcc -DLIX -DMS_HEAP_SIZE=512 -c ms.c
+ *   (link against your platform; call ms_init_lix(true) to boot with the
+ *   stdlib compiled in via ms_stdlib.h -- see tools/embed_stdlib.sh)
+ *
+ * See README.md for full language + embedding documentation.
+ */
+
+#ifndef LIX
+/* needed for getline() on some libcs/std= settings; the desktop REPL uses
+ * it for dynamically-sized, multi-line-aware input (see repl() below). */
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+#include <setjmp.h>
+
+#ifdef LIX
+#include "include/fs.h"
+#include "../common/zucker.h"
+#include "ms_stdlib.h"
+#endif
+
+/* ----------------------------------------------------------------------
+ * CONFIGURATION
+ * ------------------------------------------------------------------- */
+
+/* Number of cons/value cells in the static heap. Each cell is small
+ * (type + mark + a union, typically 24-32 bytes depending on platform).
+ * On a system with ~2KB total RAM you would set this very low (e.g. 32-64)
+ * and expect to run only small scripts -- the point is that the engine
+ * itself makes no other heap-scaling assumptions. Tune to taste. */
+#ifndef MS_HEAP_SIZE
+#define MS_HEAP_SIZE 16384
+#endif
+
+/* Maximum depth of the GC protection ("shadow") stack. This bounds how
+ * many not-yet-reachable intermediate values can be alive at once during
+ * evaluation. It scales with *non-tail* call nesting (proper tail calls
+ * use O(1) protect-stack space via the trampoline in ms_eval), so deeply
+ * recursive but non-tail-recursive Lisp code needs a deeper stack here.
+ * Each slot is one pointer (8 bytes on a 64-bit host, 4 on a 32-bit MCU).
+ * Tune down for tiny MCU targets -- just expect correspondingly shallower
+ * non-tail recursion before a clean "protect stack overflow" error. */
+#ifndef MS_PROTECT_STACK_SIZE
+#define MS_PROTECT_STACK_SIZE 16384
+#endif
+
+/* Maximum length of a single token (symbol, string, number literal). */
+#ifndef MS_MAX_TOKEN 
+#define MS_MAX_TOKEN 256
+#endif
+
+/* ----------------------------------------------------------------------
+ * TYPES
+ * ------------------------------------------------------------------- */
+
+typedef struct ms_val ms_val;
+
+typedef ms_val *(*ms_builtin)(ms_val *args);
+
+typedef enum {
+	T_FREE = 0,  /* cell is on the free list, not a live value */
+	T_NIL,       /* the empty list. NOTE: unlike #f, this is a TRUE value --
+	              * see truthy() below; R4RS requires only #f to be false. */
+	T_BOOL,      /* #t / #f -- the only two instances are g_true/g_false */
+	T_SYM,       /* interned symbol */
+	T_NUM,       /* double */
+	T_CHAR,      /* a character (code point) */
+	T_STR,       /* heap-allocated (malloc'd) string */
+	T_PAIR,      /* cons cell: car/cdr. also used for environments/frames */
+	T_VECTOR,    /* heap-allocated (malloc'd) array of ms_val* */
+	T_FUN,       /* builtin C function */
+	T_LAMBDA,    /* user-defined closure */
+	T_PROMISE,   /* delay/force */
+	T_CONT       /* an escape-only continuation captured by call/cc */
+} ms_type;
+
+typedef struct ms_cont_data {
+	jmp_buf buf;
+	bool used;        /* true once invoked or once call/cc has returned
+	                    * normally -- either way it can't be used again */
+	int wind_depth;   /* dynamic-wind stack depth at the moment of capture,
+	                    * so invoking this continuation later knows how many
+	                    * enclosing dynamic-wind "after" thunks to run */
+	ms_val *result;   /* value being delivered to the captured point */
+} ms_cont_data;
+
+struct ms_val {
+	unsigned char type;
+	unsigned char mark;
+	union {
+		double num;
+		long ch;                   /* T_CHAR */
+		char *str;                 /* T_STR, T_SYM (owns the memory) */
+		struct { ms_val *car, *cdr; } pair;   /* T_PAIR */
+		struct { ms_val **items; long len; } vec; /* T_VECTOR (owns items) */
+		ms_builtin fn;               /* T_FUN */
+		struct { ms_val *params, *body, *env; } lambda; /* T_LAMBDA */
+		struct { bool forced; ms_val *value; ms_val *thunk; } promise; /* T_PROMISE */
+		ms_cont_data *cont;          /* T_CONT (owns the ms_cont_data) */
+	} u;
+};
+
+typedef enum { MS_INFO, MS_ERROR, MS_PANIC } ms_log_level;
+
+/* ----------------------------------------------------------------------
+ * GLOBALS
+ * ------------------------------------------------------------------- */
+
+static ms_val ms_heap[MS_HEAP_SIZE];
+static ms_val *ms_freelist = NULL;
+static long ms_heap_live = 0;
+
+static ms_val *ms_symbols = NULL; /* intern list, linked through u.pair, car=sym cdr=rest */
+
+static ms_val *ms_protect_stack[MS_PROTECT_STACK_SIZE];
+static int ms_protect_top = 0;
+
+static ms_val *g_nil;
+static ms_val *g_true;
+static ms_val *g_false;
+static ms_val *g_unassigned; /* letrec placeholder, before a binding's init runs */
+static ms_val *g_eof;        /* end-of-file object */
+static ms_val *sym_quote, *sym_if, *sym_cond, *sym_begin, *sym_lambda,
+	*sym_define, *sym_defun, *sym_let, *sym_letstar, *sym_letrec, *sym_set,
+	*sym_and, *sym_or, *sym_while, *sym_quasiquote, *sym_unquote,
+	*sym_unquote_splicing, *sym_do, *sym_case, *sym_delay, *sym_else, *sym_arrow;
+
+ms_val *ms_global_env;
+
+int ms_out_of_memory_count = 0;
+
+/* dynamic-wind bookkeeping for escape-only continuations: a stack of
+ * (before . after) thunk pairs for every dynamic-wind currently in
+ * effect. When a continuation captured at an outer point is invoked,
+ * we pop and run "after" thunks down to the depth recorded at capture
+ * time. Because these continuations are escape-only (they can only
+ * jump to an *enclosing* call/cc, never back into a completed one),
+ * there is never a need to re-run "before" thunks -- only "after". */
+#ifndef MS_MAX_WINDS
+#define MS_MAX_WINDS 256
+#endif
+static struct { ms_val *before, *after; } ms_wind_stack[MS_MAX_WINDS];
+static int ms_wind_top = 0;
+
+/* ----------------------------------------------------------------------
+ * PROTOTYPES
+ * ------------------------------------------------------------------- */
+
+static void ms_log(ms_log_level level, const char *fmt, ...);
+static void ms_gc(void);
+static ms_val *alloc_cell(void);
+static ms_val *mk_num(double n);
+static ms_val *mk_str(char *owned);
+static ms_val *mk_pair(ms_val *car, ms_val *cdr);
+static ms_val *mk_sym(const char *name);
+static ms_val *mk_fun(ms_builtin fn);
+static ms_val *mk_lambda(ms_val *params, ms_val *body, ms_val *env);
+static ms_val *mk_char(long code);
+static ms_val *mk_vector(long len, ms_val *fill);
+static ms_val *mk_promise(ms_val *thunk);
+static ms_val *call_procedure(ms_val *f, ms_val *args);
+static ms_val *invoke_continuation(ms_val *k, ms_val *args);
+static ms_val *pcar(ms_val *v);
+static ms_val *pcdr(ms_val *v);
+static bool nilp(ms_val *v);
+static bool truthy(ms_val *v);
+static ms_val *ms_eval(ms_val *x, ms_val *env);
+static ms_val *env_lookup(ms_val *env, ms_val *sym);
+static void env_define(ms_val *env, ms_val *sym, ms_val *val);
+static bool env_set(ms_val *env, ms_val *sym, ms_val *val);
+static ms_val *ms_new_env(ms_val *parent);
+static bool ms_equal(ms_val *a, ms_val *b);
+static ms_val *ms_read(const char **s);
+static void ms_print(ms_val *v, bool readable);
+static char *ms_to_string(ms_val *v, bool readable);
+static void ms_load_string(const char *src, ms_val *env);
+#ifndef LIX
+static void ms_load_file(const char *filename, ms_val *env);
+#endif
+static ms_val *qq_expand(ms_val *t, ms_val *env);
+ms_val *ms_env_std(void);
+void ms_init(void);
+
+#define PUSH(v) \
+	do { \
+		if (ms_protect_top >= MS_PROTECT_STACK_SIZE) \
+			ms_log(MS_PANIC, "protect stack overflow (recursion too deep for " \
+				"MS_PROTECT_STACK_SIZE=%d; note this limits *non-tail* " \
+				"recursion depth -- proper tail calls don't consume this " \
+				"stack -- increase MS_PROTECT_STACK_SIZE or rewrite the " \
+				"recursion to be tail-recursive)", (int)MS_PROTECT_STACK_SIZE); \
+		ms_protect_stack[ms_protect_top++] = (v); \
+	} while (0)
+#define POP() (ms_protect_top--)
+#define POPN(n) (ms_protect_top -= (n))
+
+/* ----------------------------------------------------------------------
+ * LOGGING
+ * ------------------------------------------------------------------- */
+
+static void ms_log(ms_log_level level, const char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	if (level == MS_INFO) fprintf(stderr, "[info] ");
+	else if (level == MS_ERROR) fprintf(stderr, "[error] ");
+	else if (level == MS_PANIC) fprintf(stderr, "[panic] ");
+	vfprintf(stderr, fmt, args);
+	fprintf(stderr, "\n");
+	va_end(args);
+	if (level == MS_PANIC) exit(EXIT_FAILURE);
+}
+
+/* ----------------------------------------------------------------------
+ * GARBAGE COLLECTION (mark & sweep over the static cell pool)
+ *
+ * Roots:
+ *   - the global environment
+ *   - the explicit "protect" shadow stack (values not yet reachable from
+ *     an environment or another live structure, e.g. mid-construction)
+ *   - the interned symbol table
+ *
+ * Environments and closures are ordinary cons cells (see ms_new_env), so
+ * they are automatically kept alive by the same marking pass that keeps
+ * any other reachable data alive -- there is no separate, easy-to-forget
+ * "mark the environment of a lambda" step as there was in the original
+ * implementation.
+ * ------------------------------------------------------------------- */
+
+static void gc_mark(ms_val *v) {
+	if (v == NULL || v->mark) return;
+	v->mark = 1;
+	switch (v->type) {
+		case T_PAIR:
+			gc_mark(v->u.pair.car);
+			gc_mark(v->u.pair.cdr);
+			break;
+		case T_LAMBDA:
+			gc_mark(v->u.lambda.params);
+			gc_mark(v->u.lambda.body);
+			gc_mark(v->u.lambda.env);
+			break;
+		case T_VECTOR:
+			for (long i = 0; i < v->u.vec.len; i++) gc_mark(v->u.vec.items[i]);
+			break;
+		case T_PROMISE:
+			gc_mark(v->u.promise.thunk);
+			gc_mark(v->u.promise.value);
+			break;
+		default:
+			break;
+	}
+}
+
+static void ms_gc(void) {
+
+	gc_mark(ms_global_env);
+	gc_mark(ms_symbols);
+	for (int i = 0; i < ms_protect_top; i++) gc_mark(ms_protect_stack[i]);
+	for (int i = 0; i < ms_wind_top; i++) {
+		gc_mark(ms_wind_stack[i].before);
+		gc_mark(ms_wind_stack[i].after);
+	}
+
+	ms_freelist = NULL;
+	ms_heap_live = 0;
+
+	for (long i = 0; i < MS_HEAP_SIZE; i++) {
+		ms_val *c = &ms_heap[i];
+		if (c->type == T_FREE) {
+			c->u.pair.cdr = ms_freelist;
+			ms_freelist = c;
+			continue;
+		}
+		if (c->mark) {
+			c->mark = 0;
+			ms_heap_live++;
+		} else {
+			if (c->type == T_STR || c->type == T_SYM) free(c->u.str);
+			if (c->type == T_VECTOR) free(c->u.vec.items);
+			if (c->type == T_CONT) free(c->u.cont);
+			c->type = T_FREE;
+			c->u.pair.cdr = ms_freelist;
+			ms_freelist = c;
+		}
+	}
+}
+
+long ms_gc_live_count(void) { return ms_heap_live; }
+long ms_gc_heap_size(void) { return MS_HEAP_SIZE; }
+
+static ms_val *alloc_cell(void) {
+	if (ms_freelist == NULL) {
+		ms_gc();
+		if (ms_freelist == NULL) {
+			ms_out_of_memory_count++;
+			ms_log(MS_PANIC,
+				"out of memory: heap exhausted (%d live cells / %d total, "
+				"increase MS_HEAP_SIZE)",
+				(int)ms_heap_live, (int)MS_HEAP_SIZE);
+		}
+	}
+	ms_val *c = ms_freelist;
+	ms_freelist = c->u.pair.cdr;
+	c->mark = 0;
+	ms_heap_live++;
+	return c;
+}
+
+/* ----------------------------------------------------------------------
+ * CONSTRUCTORS
+ * ------------------------------------------------------------------- */
+
+static ms_val *mk_num(double n) {
+	ms_val *v = alloc_cell();
+	v->type = T_NUM;
+	v->u.num = n;
+	return v;
+}
+
+/* takes ownership of `owned` (must be malloc'd, or NULL) */
+static ms_val *mk_str(char *owned) {
+	ms_val *v = alloc_cell();
+	v->type = T_STR;
+	v->u.str = owned;
+	return v;
+}
+
+static ms_val *mk_pair(ms_val *car, ms_val *cdr) {
+	PUSH(car); PUSH(cdr);
+	ms_val *v = alloc_cell();
+	POPN(2);
+	v->type = T_PAIR;
+	v->u.pair.car = car;
+	v->u.pair.cdr = cdr;
+	return v;
+}
+
+static ms_val *mk_fun(ms_builtin fn) {
+	ms_val *v = alloc_cell();
+	v->type = T_FUN;
+	v->u.fn = fn;
+	return v;
+}
+
+static ms_val *mk_lambda(ms_val *params, ms_val *body, ms_val *env) {
+	PUSH(params); PUSH(body); PUSH(env);
+	ms_val *v = alloc_cell();
+	POPN(3);
+	v->type = T_LAMBDA;
+	v->u.lambda.params = params;
+	v->u.lambda.body = body;
+	v->u.lambda.env = env;
+	return v;
+}
+
+static ms_val *mk_char(long code) {
+	ms_val *v = alloc_cell();
+	v->type = T_CHAR;
+	v->u.ch = code;
+	return v;
+}
+
+static ms_val *mk_vector(long len, ms_val *fill) {
+	PUSH(fill);
+	ms_val *v = alloc_cell();
+	POP();
+	v->type = T_VECTOR;
+	v->u.vec.len = len;
+	v->u.vec.items = len > 0 ? malloc(sizeof(ms_val *) * (size_t)len) : NULL;
+	for (long i = 0; i < len; i++) v->u.vec.items[i] = fill;
+	return v;
+}
+
+static ms_val *mk_promise(ms_val *thunk) {
+	PUSH(thunk);
+	ms_val *v = alloc_cell();
+	POP();
+	v->type = T_PROMISE;
+	v->u.promise.forced = false;
+	v->u.promise.value = NULL;
+	v->u.promise.thunk = thunk;
+	return v;
+}
+
+/* interned symbols: identical names share one cell, so `eq?` on symbols
+ * is a pointer comparison, and special forms can be recognized by
+ * comparing against the fixed sym_* pointers. */
+static ms_val *mk_sym(const char *name) {
+	for (ms_val *p = ms_symbols; p != NULL && p->type == T_PAIR; p = p->u.pair.cdr) {
+		ms_val *s = p->u.pair.car;
+		if (strcmp(s->u.str, name) == 0) return s;
+	}
+	ms_val *v = alloc_cell();
+	v->type = T_SYM;
+	v->u.str = (char *)malloc(strlen(name) + 1);
+	strcpy(v->u.str, name);
+	PUSH(v);
+	ms_symbols = mk_pair(v, ms_symbols);
+	POP();
+	return v;
+}
+
+/* ----------------------------------------------------------------------
+ * ACCESSORS / PREDICATES
+ * ------------------------------------------------------------------- */
+
+static ms_val *pcar(ms_val *v) { return (v && v->type == T_PAIR) ? v->u.pair.car : g_nil; }
+static ms_val *pcdr(ms_val *v) { return (v && v->type == T_PAIR) ? v->u.pair.cdr : g_nil; }
+#define CAAR(v) pcar(pcar(v))
+#define CADR(v) pcar(pcdr(v))
+#define CDAR(v) pcdr(pcar(v))
+#define CDDR(v) pcdr(pcdr(v))
+#define CADDR(v) pcar(pcdr(pcdr(v)))
+
+static bool nilp(ms_val *v) { return v == NULL || v->type == T_NIL; }
+/* R4RS: #f is the only false value. In particular '() (the empty list)
+ * is TRUE, unlike many toy Lisps (including earlier revisions of this
+ * one) that conflate "empty" with "false". */
+static bool truthy(ms_val *v) { return !(v && v->type == T_BOOL && v == g_false); }
+
+static long list_length(ms_val *v) {
+	long n = 0;
+	while (v && v->type == T_PAIR) { n++; v = v->u.pair.cdr; }
+	return n;
+}
+
+/* ----------------------------------------------------------------------
+ * EQUALITY
+ *
+ * eq?    -- identity; numbers/strings compare by value as a practical
+ *           convenience (as in most small Schemes), everything else by
+ *           pointer.
+ * equal? -- deep structural equality.
+ * ------------------------------------------------------------------- */
+
+static bool ms_eq(ms_val *a, ms_val *b) {
+	if (a == b) return true;
+	if (a == NULL || b == NULL) return false;
+	if (a->type != b->type) return false;
+	if (a->type == T_NUM) return a->u.num == b->u.num;
+	if (a->type == T_CHAR) return a->u.ch == b->u.ch;
+	if (a->type == T_NIL) return true;
+	return false;
+}
+
+static bool ms_equal(ms_val *a, ms_val *b) {
+	if (a == b) return true;
+	if (a == NULL || b == NULL) return false;
+	if (a->type != b->type) return false;
+	switch (a->type) {
+		case T_NIL: return true;
+		case T_BOOL: return a == b; /* only the two singletons exist */
+		case T_NUM: return a->u.num == b->u.num;
+		case T_CHAR: return a->u.ch == b->u.ch;
+		case T_STR: return strcmp(a->u.str, b->u.str) == 0;
+		case T_SYM: return a == b; /* interned */
+		case T_PAIR:
+			return ms_equal(a->u.pair.car, b->u.pair.car) &&
+				ms_equal(a->u.pair.cdr, b->u.pair.cdr);
+		case T_VECTOR:
+			if (a->u.vec.len != b->u.vec.len) return false;
+			for (long i = 0; i < a->u.vec.len; i++)
+				if (!ms_equal(a->u.vec.items[i], b->u.vec.items[i])) return false;
+			return true;
+		default: return a == b;
+	}
+}
+
+/* ----------------------------------------------------------------------
+ * ENVIRONMENTS
+ *
+ * An environment is a plain cons cell: (frame . parent)
+ *   frame  = a mutable list of (symbol . value) pairs
+ *   parent = the enclosing environment, or NIL for the global environment
+ *
+ * Because environments are built entirely from ordinary pairs, they are
+ * automatically kept alive (or collected) by the same mark/sweep pass
+ * used for all other data -- closures simply hold a pointer to the
+ * environment they were created in (see mk_lambda / gc_mark T_LAMBDA),
+ * which is what makes closures over local variables actually work.
+ * ------------------------------------------------------------------- */
+
+static ms_val *ms_new_env(ms_val *parent) {
+	return mk_pair(g_nil, parent);
+}
+
+static ms_val *env_lookup(ms_val *env, ms_val *sym) {
+	while (env && env->type == T_PAIR) {
+		ms_val *frame = env->u.pair.car;
+		while (frame && frame->type == T_PAIR) {
+			ms_val *binding = frame->u.pair.car;
+			if (binding->u.pair.car == sym) return binding->u.pair.cdr;
+			frame = frame->u.pair.cdr;
+		}
+		env = env->u.pair.cdr;
+	}
+	return NULL;
+}
+
+static void env_define(ms_val *env, ms_val *sym, ms_val *val) {
+	PUSH(env); PUSH(sym); PUSH(val);
+	ms_val *binding = mk_pair(sym, val);
+	PUSH(binding);
+	env->u.pair.car = mk_pair(binding, env->u.pair.car);
+	POPN(4);
+}
+
+/* mutate an existing binding if found anywhere in scope; otherwise
+ * (as a practical convenience) define it in the global environment. */
+static bool env_set(ms_val *env, ms_val *sym, ms_val *val) {
+	ms_val *e = env;
+	while (e && e->type == T_PAIR) {
+		ms_val *frame = e->u.pair.car;
+		while (frame && frame->type == T_PAIR) {
+			ms_val *binding = frame->u.pair.car;
+			if (binding->u.pair.car == sym) {
+				binding->u.pair.cdr = val;
+				return true;
+			}
+			frame = frame->u.pair.cdr;
+		}
+		e = e->u.pair.cdr;
+	}
+	env_define(ms_global_env, sym, val);
+	return false;
+}
+
+/* ----------------------------------------------------------------------
+ * PRINTING
+ * ------------------------------------------------------------------- */
+
+static void print_double(double d) {
+	if (d == (long long)d && fabs(d) < 1e15)
+		printf("%lld", (long long)d);
+	else
+		printf("%g", d);
+}
+
+/* R4RS named characters. char_name_for returns the canonical name for
+ * printing (or NULL if the char should just print literally); the
+ * reader (below) recognizes all names on the left when parsing #\name. */
+static const struct { const char *name; long code; } ms_char_names[] = {
+	{"space", ' '}, {"newline", '\n'}, {"tab", '\t'}, {"return", '\r'},
+	{"nul", 0}, {"null", 0}, {"backspace", 8}, {"delete", 127},
+	{"rubout", 127}, {"escape", 27}, {"altmode", 27}, {"linefeed", '\n'},
+};
+#define MS_NUM_CHAR_NAMES (int)(sizeof(ms_char_names) / sizeof(ms_char_names[0]))
+
+static const char *char_name_for(long code) {
+	for (int i = 0; i < MS_NUM_CHAR_NAMES; i++)
+		if (ms_char_names[i].code == code) return ms_char_names[i].name;
+	return NULL;
+}
+
+static bool str_ieq(const char *a, const char *b) {
+	while (*a && *b) {
+		if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+		a++; b++;
+	}
+	return *a == *b;
+}
+
+static bool char_code_for_name(const char *name, long *out) {
+	for (int i = 0; i < MS_NUM_CHAR_NAMES; i++)
+		if (str_ieq(name, ms_char_names[i].name)) { *out = ms_char_names[i].code; return true; }
+	return false;
+}
+
+static void ms_print_inner(ms_val *v, bool readable) {
+	if (v == NULL) { printf("()"); return; }
+	switch (v->type) {
+		case T_NIL: printf("()"); break;
+		case T_BOOL: printf(v == g_true ? "#t" : "#f"); break;
+		case T_SYM: printf("%s", v->u.str); break;
+		case T_NUM: print_double(v->u.num); break;
+		case T_CHAR:
+			if (!readable) { putchar((int)v->u.ch); break; }
+			{
+				const char *nm = char_name_for(v->u.ch);
+				if (nm) printf("#\\%s", nm);
+				else if (v->u.ch >= 33 && v->u.ch < 127) printf("#\\%c", (int)v->u.ch);
+				else printf("#\\x%lx", v->u.ch);
+			}
+			break;
+		case T_STR:
+			if (readable) {
+				printf("\"");
+				for (char *p = v->u.str; *p; p++) {
+					if (*p == '"' || *p == '\\') printf("\\%c", *p);
+					else if (*p == '\n') printf("\\n");
+					else putchar(*p);
+				}
+				printf("\"");
+			} else {
+				printf("%s", v->u.str);
+			}
+			break;
+		case T_FUN: printf("#<builtin>"); break;
+		case T_LAMBDA: printf("#<procedure>"); break;
+		case T_PROMISE: printf("#<promise>"); break;
+		case T_CONT: printf("#<continuation>"); break;
+		case T_VECTOR: {
+			printf("#(");
+			for (long i = 0; i < v->u.vec.len; i++) {
+				if (i) printf(" ");
+				ms_print_inner(v->u.vec.items[i], readable);
+			}
+			printf(")");
+			break;
+		}
+		case T_PAIR:
+			printf("(");
+			ms_val *p = v;
+			bool first = true;
+			while (p && p->type == T_PAIR) {
+				if (!first) printf(" ");
+				ms_print_inner(p->u.pair.car, readable);
+				first = false;
+				p = p->u.pair.cdr;
+			}
+			if (!nilp(p)) { printf(" . "); ms_print_inner(p, readable); }
+			printf(")");
+			break;
+	}
+}
+
+static void ms_print(ms_val *v, bool readable) { ms_print_inner(v, readable); }
+
+/* render into a malloc'd string (used by (write-to-string x) style helpers) */
+static void tostr_inner(ms_val *v, bool readable, char **buf, size_t *len, size_t *cap);
+
+static void tostr_append(char **buf, size_t *len, size_t *cap, const char *s) {
+	size_t sl = strlen(s);
+	if (*len + sl + 1 > *cap) {
+		while (*len + sl + 1 > *cap) *cap *= 2;
+		*buf = realloc(*buf, *cap);
+	}
+	memcpy(*buf + *len, s, sl + 1);
+	*len += sl;
+}
+
+static void tostr_inner(ms_val *v, bool readable, char **buf, size_t *len, size_t *cap) {
+	char num[64];
+	if (v == NULL || v->type == T_NIL) { tostr_append(buf, len, cap, "()"); return; }
+	switch (v->type) {
+		case T_BOOL: tostr_append(buf, len, cap, v == g_true ? "#t" : "#f"); break;
+		case T_SYM: tostr_append(buf, len, cap, v->u.str); break;
+		case T_CHAR: {
+			if (!readable) { char c1[2] = { (char)v->u.ch, 0 }; tostr_append(buf, len, cap, c1); break; }
+			const char *nm = char_name_for(v->u.ch);
+			if (nm) { snprintf(num, sizeof(num), "#\\%s", nm); tostr_append(buf, len, cap, num); }
+			else if (v->u.ch >= 33 && v->u.ch < 127) { snprintf(num, sizeof(num), "#\\%c", (int)v->u.ch); tostr_append(buf, len, cap, num); }
+			else { snprintf(num, sizeof(num), "#\\x%lx", v->u.ch); tostr_append(buf, len, cap, num); }
+			break;
+		}
+		case T_NUM:
+			if (v->u.num == (long long)v->u.num && fabs(v->u.num) < 1e15)
+				snprintf(num, sizeof(num), "%lld", (long long)v->u.num);
+			else
+				snprintf(num, sizeof(num), "%g", v->u.num);
+			tostr_append(buf, len, cap, num);
+			break;
+		case T_STR:
+			if (readable) tostr_append(buf, len, cap, "\"");
+			tostr_append(buf, len, cap, v->u.str);
+			if (readable) tostr_append(buf, len, cap, "\"");
+			break;
+		case T_FUN: tostr_append(buf, len, cap, "#<builtin>"); break;
+		case T_LAMBDA: tostr_append(buf, len, cap, "#<procedure>"); break;
+		case T_PROMISE: tostr_append(buf, len, cap, "#<promise>"); break;
+		case T_CONT: tostr_append(buf, len, cap, "#<continuation>"); break;
+		case T_VECTOR: {
+			tostr_append(buf, len, cap, "#(");
+			for (long i = 0; i < v->u.vec.len; i++) {
+				if (i) tostr_append(buf, len, cap, " ");
+				tostr_inner(v->u.vec.items[i], readable, buf, len, cap);
+			}
+			tostr_append(buf, len, cap, ")");
+			break;
+		}
+		case T_PAIR: {
+			tostr_append(buf, len, cap, "(");
+			ms_val *p = v;
+			bool first = true;
+			while (p && p->type == T_PAIR) {
+				if (!first) tostr_append(buf, len, cap, " ");
+				tostr_inner(p->u.pair.car, readable, buf, len, cap);
+				first = false;
+				p = p->u.pair.cdr;
+			}
+			if (!nilp(p)) {
+				tostr_append(buf, len, cap, " . ");
+				tostr_inner(p, readable, buf, len, cap);
+			}
+			tostr_append(buf, len, cap, ")");
+			break;
+		}
+	}
+}
+
+static char *ms_to_string(ms_val *v, bool readable) {
+	size_t cap = 64, len = 0;
+	char *buf = malloc(cap);
+	buf[0] = 0;
+	tostr_inner(v, readable, &buf, &len, &cap);
+	return buf;
+}
+
+/* ----------------------------------------------------------------------
+ * READER
+ * ------------------------------------------------------------------- */
+
+static void skip_ws(const char **s) {
+	for (;;) {
+		while (**s && isspace((unsigned char)**s)) (*s)++;
+		if (**s == ';') {
+			while (**s && **s != '\n') (*s)++;
+			continue;
+		}
+		break;
+	}
+}
+
+static bool token_is_number(const char *tok) {
+	if (!*tok) return false;
+	const char *p = tok;
+	if (*p == '+' || *p == '-') p++;
+	if (!*p) return false;
+	bool digits = false, dot = false;
+	for (; *p; p++) {
+		if (isdigit((unsigned char)*p)) { digits = true; continue; }
+		if (*p == '.' && !dot) { dot = true; continue; }
+		return false;
+	}
+	return digits;
+}
+
+static ms_val *ms_read(const char **s) {
+
+	skip_ws(s);
+	if (**s == 0) return NULL; /* end of input */
+
+	if (**s == '(') {
+		(*s)++;
+		ms_val *head = g_nil, *tail = NULL;
+		PUSH(head);
+		for (;;) {
+			skip_ws(s);
+			if (**s == 0) { ms_log(MS_ERROR, "unexpected end of input in list"); POP(); return NULL; }
+			if (**s == ')') { (*s)++; break; }
+			/* dotted pair: "( a b . c )" -- a lone '.' followed by
+			 * whitespace/paren (not e.g. ".5" or a symbol like "->") */
+			if (**s == '.' && (isspace((unsigned char)(*s)[1]) || (*s)[1] == '(' || (*s)[1] == 0)) {
+				(*s)++;
+				ms_val *tailval = ms_read(s);
+				if (tailval == NULL) { POP(); return NULL; }
+				skip_ws(s);
+				if (**s == ')') (*s)++;
+				else ms_log(MS_ERROR, "malformed dotted list (expected ')')");
+				if (tail == NULL) { POP(); return tailval; }
+				tail->u.pair.cdr = tailval;
+				POP();
+				return head;
+			}
+			ms_val *item = ms_read(s);
+			if (item == NULL) { POP(); return NULL; }
+			PUSH(item);
+			ms_val *cell = mk_pair(item, g_nil);
+			POP(); /* item */
+			if (tail == NULL) { head = cell; ms_protect_stack[ms_protect_top - 1] = head; }
+			else tail->u.pair.cdr = cell;
+			tail = cell;
+		}
+		POP();
+		return head;
+	}
+
+	if (**s == ')') { ms_log(MS_ERROR, "unexpected ')'"); (*s)++; return ms_read(s); }
+
+	if (**s == '\'') {
+		(*s)++;
+		ms_val *inner = ms_read(s);
+		if (inner == NULL) return NULL;
+		PUSH(inner);
+		ms_val *r = mk_pair(sym_quote, mk_pair(inner, g_nil));
+		POP();
+		return r;
+	}
+
+	if (**s == '`') {
+		(*s)++;
+		ms_val *inner = ms_read(s);
+		if (inner == NULL) return NULL;
+		PUSH(inner);
+		ms_val *r = mk_pair(sym_quasiquote, mk_pair(inner, g_nil));
+		POP();
+		return r;
+	}
+
+	if (**s == ',') {
+		(*s)++;
+		ms_val *tag = sym_unquote;
+		if (**s == '@') { (*s)++; tag = sym_unquote_splicing; }
+		ms_val *inner = ms_read(s);
+		if (inner == NULL) return NULL;
+		PUSH(inner);
+		ms_val *r = mk_pair(tag, mk_pair(inner, g_nil));
+		POP();
+		return r;
+	}
+
+	if (**s == '#') {
+		(*s)++;
+		if (**s == 't') { (*s)++; while (isalpha((unsigned char)**s)) (*s)++; return g_true; }
+		if (**s == 'f') { (*s)++; while (isalpha((unsigned char)**s)) (*s)++; return g_false; }
+		if (**s == '(') {
+			/* vector literal: read the following "(...)" as an ordinary
+			 * list, then convert it to a vector. */
+			ms_val *lst = ms_read(s);
+			long n = list_length(lst);
+			PUSH(lst);
+			ms_val *vec = mk_vector(n, g_false);
+			POP();
+			long i = 0;
+			for (ms_val *p = lst; !nilp(p); p = pcdr(p)) vec->u.vec.items[i++] = pcar(p);
+			return vec;
+		}
+		if (**s == '\\') {
+			(*s)++;
+			char buf[MS_MAX_TOKEN];
+			int n = 0;
+			if (**s) { buf[n++] = **s; (*s)++; } /* first char always literal */
+			while (**s && isalnum((unsigned char)**s) && n < MS_MAX_TOKEN - 1) { buf[n++] = **s; (*s)++; }
+			buf[n] = 0;
+			if (n == 1) return mk_char((unsigned char)buf[0]);
+			long code;
+			if (char_code_for_name(buf, &code)) return mk_char(code);
+			if ((buf[0] == 'x' || buf[0] == 'X') && n > 1) return mk_char(strtol(buf + 1, NULL, 16));
+			ms_log(MS_ERROR, "unknown character name #\\%s", buf);
+			return mk_char((unsigned char)buf[0]);
+		}
+		if (**s == 'x' || **s == 'X' || **s == 'o' || **s == 'O' ||
+			**s == 'b' || **s == 'B' || **s == 'd' || **s == 'D') {
+			char radixc = **s;
+			(*s)++;
+			char buf[MS_MAX_TOKEN];
+			int n = 0;
+			while (**s && !isspace((unsigned char)**s) && **s != '(' && **s != ')' &&
+				**s != '"' && **s != ';' && n < MS_MAX_TOKEN - 1) { buf[n++] = **s; (*s)++; }
+			buf[n] = 0;
+			int base = (radixc == 'x' || radixc == 'X') ? 16
+				: (radixc == 'o' || radixc == 'O') ? 8
+				: (radixc == 'b' || radixc == 'B') ? 2 : 10;
+			return mk_num((double)strtol(buf, NULL, base));
+		}
+		if (**s == 'e' || **s == 'i') {
+			/* exactness prefix: a no-op here (see README -- numbers are
+			 * always doubles, there's no separate exact/inexact tower). */
+			(*s)++;
+			return ms_read(s);
+		}
+		ms_log(MS_ERROR, "unsupported # syntax");
+		return ms_read(s);
+	}
+
+	if (**s == '"') {
+		(*s)++;
+		char buf[MS_MAX_TOKEN];
+		int n = 0;
+		while (**s && **s != '"') {
+			char c = **s;
+			if (c == '\\' && (*s)[1]) {
+				(*s)++;
+				switch (**s) {
+					case 'n': c = '\n'; break;
+					case 't': c = '\t'; break;
+					case '"': c = '"'; break;
+					case '\\': c = '\\'; break;
+					default: c = **s; break;
+				}
+			}
+			if (n < MS_MAX_TOKEN - 1) buf[n++] = c;
+			(*s)++;
+		}
+		if (**s == '"') (*s)++;
+		buf[n] = 0;
+		char *owned = malloc(n + 1);
+		memcpy(owned, buf, n + 1);
+		return mk_str(owned);
+	}
+
+	/* bareword: symbol or number */
+	{
+		char buf[MS_MAX_TOKEN];
+		int n = 0;
+		while (**s && !isspace((unsigned char)**s) && **s != '(' && **s != ')' &&
+			**s != '\'' && **s != '"' && **s != ';')
+		{
+			if (n < MS_MAX_TOKEN - 1) buf[n++] = **s;
+			(*s)++;
+		}
+		buf[n] = 0;
+		if (n == 0) { ms_log(MS_ERROR, "parse error"); (*s)++; return ms_read(s); }
+		if (token_is_number(buf)) return mk_num(strtod(buf, NULL));
+		return mk_sym(buf);
+	}
+}
+
+/* ----------------------------------------------------------------------
+ * EVAL
+ * ------------------------------------------------------------------- */
+
+static ms_val *eval_body(ms_val *body, ms_val *env) {
+	/* evaluate all but the last expr for effect; caller tail-calls the last */
+	if (nilp(body)) return g_nil;
+	while (!nilp(pcdr(body))) {
+		ms_eval(pcar(body), env);
+		body = pcdr(body);
+	}
+	return pcar(body);
+}
+
+static ms_val *eval_list(ms_val *args, ms_val *env) {
+	ms_val *head = g_nil, *tail = NULL;
+	PUSH(head); PUSH(env);
+	while (!nilp(args)) {
+		ms_val *v = ms_eval(pcar(args), env);
+		PUSH(v);
+		ms_val *cell = mk_pair(v, g_nil);
+		POP();
+		if (tail == NULL) { head = cell; ms_protect_stack[ms_protect_top - 2] = head; }
+		else tail->u.pair.cdr = cell;
+		tail = cell;
+		args = pcdr(args);
+	}
+	POPN(2);
+	return head;
+}
+
+static ms_val *bind_params(ms_val *params, ms_val *args, ms_val *parent_env) {
+	PUSH(parent_env); PUSH(args);
+	ms_val *env = ms_new_env(parent_env);
+	POPN(2);
+	PUSH(env); PUSH(args);
+	while (!nilp(params) && !nilp(args)) {
+		if (params->type == T_SYM) {
+			/* dotted rest-param: (lambda (a b . rest) ...) */
+			env_define(env, params, args);
+			args = g_nil;
+			params = g_nil;
+			break;
+		}
+		env_define(env, pcar(params), pcar(args));
+		params = pcdr(params);
+		args = pcdr(args);
+	}
+	if (params->type == T_SYM) env_define(env, params, g_nil);
+	POPN(2);
+	return env;
+}
+
+ms_val *ms_eval(ms_val *x, ms_val *env) {
+
+	PUSH(x); PUSH(env);
+
+tail_call:
+	ms_protect_stack[ms_protect_top - 2] = x;
+	ms_protect_stack[ms_protect_top - 1] = env;
+
+	if (x == NULL || x->type == T_NIL || x->type == T_NUM || x->type == T_STR ||
+		x->type == T_BOOL || x->type == T_CHAR || x->type == T_VECTOR ||
+		x->type == T_FUN || x->type == T_LAMBDA || x->type == T_PROMISE ||
+		x->type == T_CONT) {
+		POPN(2);
+		return x;
+	}
+
+	if (x->type == T_SYM) {
+		ms_val *v = env_lookup(env, x);
+		POPN(2);
+		if (v == NULL) {
+			ms_log(MS_ERROR, "unbound symbol: %s", x->u.str);
+			return g_false;
+		}
+		return v;
+	}
+
+	if (x->type != T_PAIR) { POPN(2); return g_false; }
+
+	ms_val *op = x->u.pair.car;
+	ms_val *args = x->u.pair.cdr;
+
+	if (op->type == T_SYM) {
+
+		if (op == sym_quote) { POPN(2); return pcar(args); }
+
+		if (op == sym_if) {
+			ms_val *test = ms_eval(pcar(args), env);
+			if (truthy(test)) { x = CADR(args); goto tail_call; }
+			ms_val *rest = CDDR(args);
+			if (nilp(rest)) { POPN(2); return g_false; }
+			x = pcar(rest);
+			goto tail_call;
+		}
+
+		if (op == sym_cond) {
+			ms_val *clauses = args;
+			while (!nilp(clauses)) {
+				ms_val *clause = pcar(clauses);
+				ms_val *test = pcar(clause);
+				bool is_else = (test == sym_else);
+				ms_val *tv = is_else ? g_true : ms_eval(test, env);
+				if (truthy(tv)) {
+					ms_val *body = pcdr(clause);
+					if (nilp(body)) { POPN(2); return tv; }
+					/* (test => proc) form: call proc with the test value */
+					if (pcar(body) == sym_arrow) {
+						ms_val *proc = ms_eval(CADR(body), env);
+						PUSH(proc); PUSH(tv);
+						ms_val *r = call_procedure(proc, mk_pair(tv, g_nil));
+						POPN(2);
+						POPN(2);
+						return r;
+					}
+					x = eval_body(body, env);
+					goto tail_call;
+				}
+				clauses = pcdr(clauses);
+			}
+			POPN(2);
+			return g_false;
+		}
+
+		if (op == sym_begin) {
+			if (nilp(args)) { POPN(2); return g_false; }
+			x = eval_body(args, env);
+			goto tail_call;
+		}
+
+		if (op == sym_and) {
+			if (nilp(args)) { POPN(2); return g_true; }
+			while (!nilp(pcdr(args))) {
+				ms_val *v = ms_eval(pcar(args), env);
+				if (!truthy(v)) { POPN(2); return v; }
+				args = pcdr(args);
+			}
+			x = pcar(args);
+			goto tail_call;
+		}
+
+		if (op == sym_or) {
+			if (nilp(args)) { POPN(2); return g_false; }
+			while (!nilp(pcdr(args))) {
+				ms_val *v = ms_eval(pcar(args), env);
+				if (truthy(v)) { POPN(2); return v; }
+				args = pcdr(args);
+			}
+			x = pcar(args);
+			goto tail_call;
+		}
+
+		if (op == sym_while) {
+			ms_val *test = pcar(args);
+			ms_val *body = pcdr(args);
+			while (truthy(ms_eval(test, env)))
+				for (ms_val *b = body; !nilp(b); b = pcdr(b)) ms_eval(pcar(b), env);
+			POPN(2);
+			return g_false;
+		}
+
+		if (op == sym_lambda) {
+			ms_val *r = mk_lambda(pcar(args), pcdr(args), env);
+			POPN(2);
+			return r;
+		}
+
+		if (op == sym_let) {
+			ms_val *first = pcar(args);
+			if (first->type == T_SYM) {
+				/* named let: (let loop ((x init) ...) body...) desugars to
+				 * a self-referential procedure, called once with the
+				 * initial values. Recursive calls to `loop` inside body
+				 * go through the normal application path, so this loop
+				 * is properly tail-recursive just like a top-level
+				 * tail-recursive function. */
+				ms_val *name = first;
+				ms_val *bindings = CADR(args);
+				ms_val *body = CDDR(args);
+				PUSH(name); PUSH(bindings); PUSH(body);
+				ms_val *newenv = ms_new_env(env);
+				PUSH(newenv);
+				ms_val *params = g_nil, *ptail = NULL;
+				ms_val *b = bindings;
+				while (!nilp(b)) {
+					ms_val *bind = pcar(b);
+					ms_val *val = ms_eval(CADR(bind), env);
+					env_define(newenv, pcar(bind), val);
+					ms_val *pc = mk_pair(pcar(bind), g_nil);
+					if (ptail == NULL) { params = pc; ms_protect_stack[ms_protect_top - 1] = newenv; }
+					else ptail->u.pair.cdr = pc;
+					ptail = pc;
+					b = pcdr(b);
+				}
+				ms_val *fn = mk_lambda(params, body, newenv);
+				env_define(newenv, name, fn);
+				POPN(4);
+				env = newenv;
+				x = eval_body(body, env);
+				goto tail_call;
+			}
+			ms_val *bindings = first;
+			ms_val *body = pcdr(args);
+			PUSH(bindings); PUSH(body);
+			ms_val *newenv = ms_new_env(env);
+			PUSH(newenv);
+			ms_val *b = bindings;
+			while (!nilp(b)) {
+				ms_val *bind = pcar(b);
+				ms_val *val = ms_eval(CADR(bind), env); /* let: evaluated in outer env */
+				env_define(newenv, pcar(bind), val);
+				b = pcdr(b);
+			}
+			POPN(3);
+			env = newenv;
+			x = eval_body(body, env);
+			goto tail_call;
+		}
+
+		if (op == sym_letstar) {
+			ms_val *bindings = pcar(args);
+			ms_val *body = pcdr(args);
+			PUSH(bindings); PUSH(body);
+			ms_val *newenv = ms_new_env(env);
+			PUSH(newenv);
+			ms_val *b = bindings;
+			while (!nilp(b)) {
+				ms_val *bind = pcar(b);
+				ms_val *val = ms_eval(CADR(bind), newenv); /* let*: sequential */
+				env_define(newenv, pcar(bind), val);
+				b = pcdr(b);
+			}
+			POPN(3);
+			env = newenv;
+			x = eval_body(body, env);
+			goto tail_call;
+		}
+
+		if (op == sym_letrec) {
+			/* bind every variable to an "unassigned" placeholder first, so
+			 * that mutually-recursive lambdas defined here can already see
+			 * each other's names, then evaluate each init expression (in
+			 * the new environment, so they too can refer to one another)
+			 * and fill in the real value. */
+			ms_val *bindings = pcar(args);
+			ms_val *body = pcdr(args);
+			PUSH(bindings); PUSH(body);
+			ms_val *newenv = ms_new_env(env);
+			PUSH(newenv);
+			for (ms_val *b = bindings; !nilp(b); b = pcdr(b))
+				env_define(newenv, pcar(pcar(b)), g_unassigned);
+			for (ms_val *b = bindings; !nilp(b); b = pcdr(b)) {
+				ms_val *bind = pcar(b);
+				ms_val *val = ms_eval(CADR(bind), newenv);
+				env_set(newenv, pcar(bind), val);
+			}
+			POPN(3);
+			env = newenv;
+			x = eval_body(body, env);
+			goto tail_call;
+		}
+
+		if (op == sym_do) {
+			/* (do ((var init step) ...) (test result...) command...) */
+			ms_val *bindings = pcar(args);
+			ms_val *testclause = CADR(args);
+			ms_val *commands = CDDR(args);
+			PUSH(bindings); PUSH(testclause); PUSH(commands);
+			ms_val *loopenv = ms_new_env(env);
+			PUSH(loopenv);
+			for (ms_val *b = bindings; !nilp(b); b = pcdr(b)) {
+				ms_val *bind = pcar(b);
+				env_define(loopenv, pcar(bind), ms_eval(CADR(bind), env));
+			}
+			for (;;) {
+				ms_val *tv = ms_eval(pcar(testclause), loopenv);
+				if (truthy(tv)) {
+					ms_val *results = pcdr(testclause);
+					POPN(4);
+					if (nilp(results)) return g_false;
+					env = loopenv;
+					x = eval_body(results, env);
+					goto tail_call;
+				}
+				for (ms_val *c = commands; !nilp(c); c = pcdr(c)) ms_eval(pcar(c), loopenv);
+				/* compute all step values using the CURRENT bindings
+				 * before rebinding any of them (simultaneous update) */
+				ms_val *newvals = g_nil, *nvtail = NULL;
+				PUSH(newvals);
+				for (ms_val *b = bindings; !nilp(b); b = pcdr(b)) {
+					ms_val *bind = pcar(b);
+					ms_val *step = nilp(CDDR(bind)) ? pcar(bind) : CADDR(bind);
+					ms_val *v = ms_eval(step, loopenv);
+					PUSH(v);
+					ms_val *cell = mk_pair(v, g_nil);
+					POP();
+					if (nvtail == NULL) { newvals = cell; ms_protect_stack[ms_protect_top - 1] = newvals; }
+					else nvtail->u.pair.cdr = cell;
+					nvtail = cell;
+				}
+				ms_val *nv = newvals;
+				for (ms_val *b = bindings; !nilp(b); b = pcdr(b), nv = pcdr(nv))
+					env_set(loopenv, pcar(pcar(b)), pcar(nv));
+				POP(); /* newvals */
+			}
+		}
+
+		if (op == sym_case) {
+			ms_val *keyval = ms_eval(pcar(args), env);
+			PUSH(keyval);
+			ms_val *clauses = pcdr(args);
+			while (!nilp(clauses)) {
+				ms_val *clause = pcar(clauses);
+				ms_val *datums = pcar(clause);
+				bool match = (datums == sym_else);
+				if (!match) for (ms_val *p = datums; !nilp(p); p = pcdr(p))
+					if (ms_eq(keyval, pcar(p))) { match = true; break; }
+				if (match) {
+					ms_val *body = pcdr(clause);
+					POP();
+					if (nilp(body)) { POPN(2); return g_false; }
+					x = eval_body(body, env);
+					goto tail_call;
+				}
+				clauses = pcdr(clauses);
+			}
+			POPN(3);
+			return g_false;
+		}
+
+		if (op == sym_delay) {
+			ms_val *thunk = mk_lambda(g_nil, args, env);
+			ms_val *p = mk_promise(thunk);
+			POPN(2);
+			return p;
+		}
+
+		if (op == sym_set) {
+			ms_val *sym = pcar(args);
+			ms_val *val = ms_eval(CADR(args), env);
+			env_set(env, sym, val);
+			POPN(2);
+			return val;
+		}
+
+		if (op == sym_define) {
+			ms_val *target = pcar(args);
+			if (target->type == T_PAIR) {
+				/* (define (name . params) body...) */
+				ms_val *name = pcar(target);
+				ms_val *params = pcdr(target);
+				ms_val *body = pcdr(args);
+				PUSH(name);
+				ms_val *fn = mk_lambda(params, body, env);
+				PUSH(fn);
+				env_define(env, name, fn);
+				POPN(4);
+				return name;
+			} else {
+				ms_val *val = nilp(pcdr(args)) ? g_nil : ms_eval(CADR(args), env);
+				PUSH(val);
+				env_define(env, target, val);
+				POPN(3);
+				return target;
+			}
+		}
+
+		if (op == sym_defun) {
+			ms_val *name = pcar(args);
+			ms_val *params = CADR(args);
+			ms_val *body = CDDR(args);
+			PUSH(name);
+			ms_val *fn = mk_lambda(params, body, env);
+			PUSH(fn);
+			env_define(env, name, fn);
+			POPN(4);
+			return name;
+		}
+
+		if (op == sym_quasiquote) {
+			/* minimal quasiquote: supports ,x and ,@x at any depth-1 position */
+			ms_val *tmpl = pcar(args);
+			ms_val *r = qq_expand(tmpl, env);
+			POPN(2);
+			return r;
+		}
+	}
+
+	/* function application. `f` and `argv` are kept protected together
+	 * through the entire call -- important because `f` may be an
+	 * ephemeral, not-yet-bound-anywhere value, e.g. the result of
+	 * evaluating an inline `(lambda ...)` in operator position, as in
+	 * `((lambda (x) x) 5)`. */
+	ms_val *f = ms_eval(op, env);
+	PUSH(f);
+	ms_val *argv = eval_list(args, env);
+	PUSH(argv);
+
+	if (f->type != T_FUN && f->type != T_LAMBDA && f->type != T_CONT) {
+		if (truthy(f)) ms_log(MS_ERROR, "attempt to call a non-function");
+		POPN(4);
+		return g_false;
+	}
+
+	if (f->type == T_FUN) {
+		ms_val *r = f->u.fn(argv);
+		POPN(4);
+		return r;
+	}
+
+	if (f->type == T_CONT) {
+		ms_val *r = invoke_continuation(f, argv);
+		POPN(4);
+		return r; /* only reached if the continuation turned out to be
+		           * invalid/expired; invoke_continuation longjmps away
+		           * on the normal path and never returns here */
+	}
+
+	{
+		ms_val *newenv = bind_params(f->u.lambda.params, argv, f->u.lambda.env);
+		ms_val *body = f->u.lambda.body;
+		POPN(2); /* drop f, argv only -- keep this frame's x/env slots for goto */
+		env = newenv;
+		x = eval_body(body, env);
+		goto tail_call;
+	}
+}
+
+/* Calls any callable value (builtin, closure, or continuation) with an
+ * already-evaluated argument list. Used by builtins that need to call
+ * back into Lisp code (apply, force, dynamic-wind, call/cc, map, etc.)
+ * without going through the special-form machinery in ms_eval. */
+static ms_val *call_procedure(ms_val *f, ms_val *args) {
+	PUSH(f); PUSH(args);
+	ms_val *r;
+	if (f->type == T_FUN) {
+		r = f->u.fn(args);
+	} else if (f->type == T_CONT) {
+		r = invoke_continuation(f, args);
+	} else if (f->type == T_LAMBDA) {
+		ms_val *newenv = bind_params(f->u.lambda.params, args, f->u.lambda.env);
+		PUSH(newenv);
+		ms_val *last = eval_body(f->u.lambda.body, newenv);
+		r = ms_eval(last, newenv);
+		POP();
+	} else {
+		ms_log(MS_PANIC, "attempt to call a non-procedure");
+		r = g_false;
+	}
+	POPN(2);
+	return r;
+}
+
+/* Invokes a captured continuation: runs any dynamic-wind "after" thunks
+ * for winds entered since the continuation was captured, then longjmps
+ * back to the call/cc call site. This is an ESCAPE-ONLY continuation --
+ * it can only transfer control to an *enclosing*, still-active call/cc;
+ * it cannot be invoked again after that call/cc has already returned
+ * (there is no re-entry / multi-shot support -- see README). */
+static ms_val *invoke_continuation(ms_val *k, ms_val *args) {
+	ms_cont_data *cd = k->u.cont;
+	if (cd->used) {
+		ms_log(MS_ERROR, "continuation invoked outside its dynamic extent "
+			"(this is an escape-only continuation -- it can't be re-entered "
+			"after its call/cc has already returned)");
+		return g_false;
+	}
+	ms_val *value = nilp(args) ? g_false : pcar(args);
+	PUSH(value); /* protect across the after-thunk calls below */
+	while (ms_wind_top > cd->wind_depth) {
+		ms_wind_top--;
+		call_procedure(ms_wind_stack[ms_wind_top].after, g_nil);
+	}
+	cd->result = value;
+	cd->used = true;
+	longjmp(cd->buf, 1);
+	return g_false; /* unreachable */
+}
+
+/* quasiquote expansion (kept separate for readability) */
+static ms_val *qq_expand(ms_val *t, ms_val *env) {
+	if (t == NULL || t->type != T_PAIR) return t;
+	ms_val *h = pcar(t);
+	if (h == sym_unquote) return ms_eval(CADR(t), env);
+	if (h->type == T_PAIR && pcar(h) == sym_unquote_splicing) {
+		ms_val *spliced = ms_eval(CADR(h), env);
+		PUSH(spliced);
+		ms_val *rest = qq_expand(pcdr(t), env);
+		POP();
+		if (nilp(spliced)) return rest;
+		/* copy spliced list and append rest */
+		ms_val *head = g_nil, *tail = NULL;
+		PUSH(rest); PUSH(head);
+		for (ms_val *p = spliced; !nilp(p); p = pcdr(p)) {
+			ms_val *cell = mk_pair(pcar(p), g_nil);
+			if (tail == NULL) { head = cell; ms_protect_stack[ms_protect_top - 1] = head; }
+			else tail->u.pair.cdr = cell;
+			tail = cell;
+		}
+		if (tail) tail->u.pair.cdr = rest; else head = rest;
+		POPN(2);
+		return head;
+	}
+	PUSH(env);
+	ms_val *car2 = qq_expand(h, env);
+	PUSH(car2);
+	ms_val *cdr2 = qq_expand(pcdr(t), env);
+	POP(); POP();
+	return mk_pair(car2, cdr2);
+}
+
+/* ----------------------------------------------------------------------
+ * LOAD (source is entirely in-memory; no fopen on LIX)
+ * ------------------------------------------------------------------- */
+
+static void ms_load_string(const char *src, ms_val *env) {
+	const char *p = src;
+	for (;;) {
+		ms_val *form = ms_read(&p);
+		if (form == NULL) break;
+		PUSH(form);
+		ms_eval(form, env);
+		POP();
+	}
+}
+
+#ifndef LIX
+static void ms_load_file(const char *filename, ms_val *env) {
+	FILE *fp = fopen(filename, "r");
+	if (!fp) { ms_log(MS_ERROR, "file not found: %s", filename); return; }
+	fseek(fp, 0L, SEEK_END);
+	long size = ftell(fp);
+	rewind(fp);
+	char *buf = malloc(size + 1);
+	size_t rd = fread(buf, 1, size, fp);
+	buf[rd] = 0;
+	fclose(fp);
+	ms_load_string(buf, env);
+	free(buf);
+}
+#endif
+
+/* ----------------------------------------------------------------------
+ * BUILTINS
+ *
+ * All builtins receive an already-evaluated argument list (eval_list
+ * handles evaluation for ordinary calls; special forms above are handled
+ * directly in ms_eval and never reach here).
+ * ------------------------------------------------------------------- */
+
+#define ARG1 (pcar(args))
+#define ARG2 (CADR(args))
+#define ARG3 (CADDR(args))
+
+static void need_num(ms_val *v, const char *who) {
+	if (v->type != T_NUM) ms_log(MS_PANIC, "%s: expected a number", who);
+}
+
+static ms_val *bi_car(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_PAIR) ms_log(MS_PANIC, "car: expected a pair");
+	return x->u.pair.car;
+}
+static ms_val *bi_cdr(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_PAIR) ms_log(MS_PANIC, "cdr: expected a pair");
+	return x->u.pair.cdr;
+}
+static ms_val *bi_cons(ms_val *args) { return mk_pair(ARG1, ARG2); }
+static ms_val *bi_set_car(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_PAIR) ms_log(MS_PANIC, "set-car!: expected a pair");
+	x->u.pair.car = ARG2;
+	return g_false;
+}
+static ms_val *bi_set_cdr(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_PAIR) ms_log(MS_PANIC, "set-cdr!: expected a pair");
+	x->u.pair.cdr = ARG2;
+	return g_false;
+}
+static ms_val *bi_pair_p(ms_val *args) { return ARG1->type == T_PAIR ? g_true : g_false; }
+static ms_val *bi_null_p(ms_val *args) { return nilp(ARG1) ? g_true : g_false; }
+static ms_val *bi_atom_p(ms_val *args) {
+	ms_val *x = ARG1;
+	return (x->type != T_PAIR) ? g_true : g_false;
+}
+static ms_val *bi_num_p(ms_val *args) { return ARG1->type == T_NUM ? g_true : g_false; }
+static ms_val *bi_str_p(ms_val *args) { return ARG1->type == T_STR ? g_true : g_false; }
+static ms_val *bi_sym_p(ms_val *args) { return ARG1->type == T_SYM ? g_true : g_false; }
+static ms_val *bi_bool_p(ms_val *args) { return ARG1->type == T_BOOL ? g_true : g_false; }
+static ms_val *bi_char_p(ms_val *args) { return ARG1->type == T_CHAR ? g_true : g_false; }
+static ms_val *bi_vector_p(ms_val *args) { return ARG1->type == T_VECTOR ? g_true : g_false; }
+static ms_val *bi_proc_p(ms_val *args) {
+	ms_val *x = ARG1;
+	return (x->type == T_FUN || x->type == T_LAMBDA || x->type == T_CONT) ? g_true : g_false;
+}
+
+static ms_val *bi_eq(ms_val *args) { return ms_eq(ARG1, ARG2) ? g_true : g_false; }
+static ms_val *bi_equal(ms_val *args) { return ms_equal(ARG1, ARG2) ? g_true : g_false; }
+static ms_val *bi_not(ms_val *args) { return truthy(ARG1) ? g_false : g_true; }
+
+static ms_val *bi_lt(ms_val *args) { need_num(ARG1,"<"); need_num(ARG2,"<"); return ARG1->u.num < ARG2->u.num ? g_true : g_false; }
+static ms_val *bi_lte(ms_val *args) { need_num(ARG1,"<="); need_num(ARG2,"<="); return ARG1->u.num <= ARG2->u.num ? g_true : g_false; }
+static ms_val *bi_gt(ms_val *args) { need_num(ARG1,">"); need_num(ARG2,">"); return ARG1->u.num > ARG2->u.num ? g_true : g_false; }
+static ms_val *bi_gte(ms_val *args) { need_num(ARG1,">="); need_num(ARG2,">="); return ARG1->u.num >= ARG2->u.num ? g_true : g_false; }
+static ms_val *bi_numeq(ms_val *args) {
+	ms_val *p = args;
+	if (nilp(p)) return g_true;
+	need_num(pcar(p), "=");
+	double first = pcar(p)->u.num;
+	p = pcdr(p);
+	while (!nilp(p)) {
+		need_num(pcar(p), "=");
+		if (pcar(p)->u.num != first) return g_false;
+		p = pcdr(p);
+	}
+	return g_true;
+}
+
+static ms_val *bi_add(ms_val *args) {
+	double r = 0;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) { need_num(pcar(p), "+"); r += pcar(p)->u.num; }
+	return mk_num(r);
+}
+static ms_val *bi_sub(ms_val *args) {
+	if (nilp(args)) return mk_num(0);
+	need_num(pcar(args), "-");
+	if (nilp(pcdr(args))) return mk_num(-pcar(args)->u.num);
+	double r = pcar(args)->u.num;
+	for (ms_val *p = pcdr(args); !nilp(p); p = pcdr(p)) { need_num(pcar(p), "-"); r -= pcar(p)->u.num; }
+	return mk_num(r);
+}
+static ms_val *bi_mul(ms_val *args) {
+	double r = 1;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) { need_num(pcar(p), "*"); r *= pcar(p)->u.num; }
+	return mk_num(r);
+}
+static ms_val *bi_div(ms_val *args) {
+	if (nilp(args)) return mk_num(1);
+	need_num(pcar(args), "/");
+	if (nilp(pcdr(args))) return mk_num(1.0 / pcar(args)->u.num);
+	double r = pcar(args)->u.num;
+	for (ms_val *p = pcdr(args); !nilp(p); p = pcdr(p)) {
+		need_num(pcar(p), "/");
+		if (pcar(p)->u.num == 0) ms_log(MS_PANIC, "/: division by zero");
+		r /= pcar(p)->u.num;
+	}
+	return mk_num(r);
+}
+static ms_val *bi_mod(ms_val *args) {
+	need_num(ARG1, "%"); need_num(ARG2, "%");
+	if (ARG2->u.num == 0) ms_log(MS_PANIC, "%%: division by zero");
+	return mk_num(fmod(ARG1->u.num, ARG2->u.num));
+}
+static ms_val *bi_quotient(ms_val *args) {
+	need_num(ARG1, "quotient"); need_num(ARG2, "quotient");
+	if (ARG2->u.num == 0) ms_log(MS_PANIC, "quotient: division by zero");
+	return mk_num(trunc(ARG1->u.num / ARG2->u.num));
+}
+static ms_val *bi_remainder(ms_val *args) {
+	need_num(ARG1, "remainder"); need_num(ARG2, "remainder");
+	if (ARG2->u.num == 0) ms_log(MS_PANIC, "remainder: division by zero");
+	return mk_num(fmod(ARG1->u.num, ARG2->u.num));
+}
+static ms_val *bi_modulo(ms_val *args) {
+	need_num(ARG1, "modulo"); need_num(ARG2, "modulo");
+	double a = ARG1->u.num, b = ARG2->u.num;
+	if (b == 0) ms_log(MS_PANIC, "modulo: division by zero");
+	double r = fmod(a, b);
+	if (r != 0 && ((r < 0) != (b < 0))) r += b;
+	return mk_num(r);
+}
+static double gcd2(double a, double b) { a = fabs(a); b = fabs(b); while (b != 0) { double t = fmod(a, b); a = b; b = t; } return a; }
+static ms_val *bi_gcd(ms_val *args) {
+	double r = 0;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) { need_num(pcar(p), "gcd"); r = gcd2(r, pcar(p)->u.num); }
+	return mk_num(r);
+}
+static ms_val *bi_lcm(ms_val *args) {
+	double r = 1;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) {
+		need_num(pcar(p), "lcm");
+		double v = fabs(pcar(p)->u.num);
+		if (v == 0) return mk_num(0);
+		double g = gcd2(r, v);
+		r = (r / g) * v;
+	}
+	return mk_num(r);
+}
+static ms_val *bi_expt(ms_val *args) {
+	need_num(ARG1, "expt"); need_num(ARG2, "expt");
+	return mk_num(pow(ARG1->u.num, ARG2->u.num));
+}
+static ms_val *bi_abs(ms_val *args) { need_num(ARG1, "abs"); return mk_num(fabs(ARG1->u.num)); }
+static ms_val *bi_floor(ms_val *args) { need_num(ARG1, "floor"); return mk_num(floor(ARG1->u.num)); }
+static ms_val *bi_ceiling(ms_val *args) { need_num(ARG1, "ceiling"); return mk_num(ceil(ARG1->u.num)); }
+static ms_val *bi_truncate(ms_val *args) { need_num(ARG1, "truncate"); return mk_num(trunc(ARG1->u.num)); }
+static ms_val *bi_round(ms_val *args) {
+	need_num(ARG1, "round");
+	double v = ARG1->u.num, f = floor(v), diff = v - f;
+	double r = (diff < 0.5) ? f : (diff > 0.5) ? f + 1 : (fmod(f, 2) == 0 ? f : f + 1); /* round-to-even */
+	return mk_num(r);
+}
+static ms_val *bi_sqrt(ms_val *args) { need_num(ARG1, "sqrt"); return mk_num(sqrt(ARG1->u.num)); }
+static ms_val *bi_min(ms_val *args) {
+	need_num(ARG1, "min");
+	double r = ARG1->u.num;
+	for (ms_val *p = pcdr(args); !nilp(p); p = pcdr(p)) { need_num(pcar(p), "min"); if (pcar(p)->u.num < r) r = pcar(p)->u.num; }
+	return mk_num(r);
+}
+static ms_val *bi_max(ms_val *args) {
+	need_num(ARG1, "max");
+	double r = ARG1->u.num;
+	for (ms_val *p = pcdr(args); !nilp(p); p = pcdr(p)) { need_num(pcar(p), "max"); if (pcar(p)->u.num > r) r = pcar(p)->u.num; }
+	return mk_num(r);
+}
+static ms_val *bi_zero_p(ms_val *args) { need_num(ARG1, "zero?"); return ARG1->u.num == 0 ? g_true : g_false; }
+static ms_val *bi_positive_p(ms_val *args) { need_num(ARG1, "positive?"); return ARG1->u.num > 0 ? g_true : g_false; }
+static ms_val *bi_negative_p(ms_val *args) { need_num(ARG1, "negative?"); return ARG1->u.num < 0 ? g_true : g_false; }
+static ms_val *bi_odd_p(ms_val *args) { need_num(ARG1, "odd?"); return fmod(ARG1->u.num, 2) != 0 ? g_true : g_false; }
+static ms_val *bi_even_p(ms_val *args) { need_num(ARG1, "even?"); return fmod(ARG1->u.num, 2) == 0 ? g_true : g_false; }
+/* documented numeric-tower simplification: numbers are always doubles,
+ * there's no separate exact/inexact representation (see README). */
+static ms_val *bi_exact_p(ms_val *args) { (void)args; return g_false; }
+static ms_val *bi_inexact_p(ms_val *args) { (void)args; return g_true; }
+static ms_val *bi_exact_to_inexact(ms_val *args) { return ARG1; }
+static ms_val *bi_inexact_to_exact(ms_val *args) { return ARG1; }
+
+static ms_val *bi_list(ms_val *args) { return args; }
+
+static ms_val *bi_length(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type == T_STR) return mk_num((double)strlen(x->u.str));
+	return mk_num((double)list_length(x));
+}
+
+static ms_val *bi_apply(ms_val *args) {
+	ms_val *f = ARG1;
+	/* (apply proc arg1 ... args) -- all args except the last are passed
+	 * through directly, the last must be a list whose elements are
+	 * appended to the call. */
+	ms_val *rest = pcdr(args);
+	if (nilp(rest)) return call_procedure(f, g_nil);
+	PUSH(f);
+	ms_val *head = g_nil, *tail = NULL;
+	PUSH(head);
+	while (!nilp(pcdr(rest))) {
+		ms_val *cell = mk_pair(pcar(rest), g_nil);
+		if (tail == NULL) { head = cell; ms_protect_stack[ms_protect_top - 1] = head; }
+		else tail->u.pair.cdr = cell;
+		tail = cell;
+		rest = pcdr(rest);
+	}
+	ms_val *final_list = pcar(rest);
+	if (tail == NULL) head = final_list; else tail->u.pair.cdr = final_list;
+	POPN(2);
+	return call_procedure(f, head);
+}
+
+static ms_val *bi_eval(ms_val *args) { return ms_eval(ARG1, ms_global_env); }
+
+static ms_val *bi_read(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_STR) ms_log(MS_PANIC, "read: expected a string");
+	const char *p = x->u.str;
+	ms_val *r = ms_read(&p);
+	return r == NULL ? g_eof : r;
+}
+static ms_val *bi_eof_object_p(ms_val *args) { return ARG1 == g_eof ? g_true : g_false; }
+
+static ms_val *bi_print(ms_val *args) {
+	if (nilp(args)) { printf("\n"); return g_false; }
+	ms_val *x = ARG1;
+	if (x->type == T_STR) printf("%s\n", x->u.str); else { ms_print(x, true); printf("\n"); }
+	return g_false;
+}
+static ms_val *bi_display(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type == T_STR) printf("%s", x->u.str); else ms_print(x, false);
+	fflush(stdout);
+	return g_false;
+}
+static ms_val *bi_write(ms_val *args) { ms_print(ARG1, true); fflush(stdout); return g_false; }
+
+static ms_val *bi_gc(ms_val *args) {
+	(void)args;
+	long before = ms_heap_live;
+	ms_gc();
+	printf("gc: %ld -> %ld live cells (of %ld)\n", before, ms_heap_live, (long)MS_HEAP_SIZE);
+	return g_true;
+}
+
+static ms_val *bi_exit(ms_val *args) {
+	exit(nilp(args) ? 0 : (int)ARG1->u.num);
+}
+
+static ms_val *bi_str_to_list(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_STR) ms_log(MS_PANIC, "str->list: expected a string");
+	ms_val *head = g_nil, *tail = NULL;
+	PUSH(head);
+	for (char *p = x->u.str; *p; p++) {
+		char buf[2] = { *p, 0 };
+		ms_val *sym = mk_sym(buf);
+		PUSH(sym);
+		ms_val *cell = mk_pair(sym, g_nil);
+		POP();
+		if (tail == NULL) { head = cell; ms_protect_stack[ms_protect_top - 1] = head; }
+		else tail->u.pair.cdr = cell;
+		tail = cell;
+	}
+	POP();
+	return head;
+}
+
+static ms_val *bi_list_to_str(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_PAIR && x->type != T_NIL) ms_log(MS_PANIC, "list->str: expected a list");
+	size_t cap = 64, len = 0;
+	char *buf = malloc(cap);
+	for (ms_val *p = x; !nilp(p); p = pcdr(p)) {
+		ms_val *item = pcar(p);
+		const char *s;
+		char onec[2];
+		if (item->type == T_NUM) { onec[0] = (char)(int)item->u.num; onec[1] = 0; s = onec; }
+		else if (item->type == T_SYM || item->type == T_STR) s = item->u.str;
+		else { ms_log(MS_ERROR, "list->str: expected atoms/strings/nums"); continue; }
+		size_t sl = strlen(s);
+		if (len + sl + 1 > cap) { while (len + sl + 1 > cap) cap *= 2; buf = realloc(buf, cap); }
+		memcpy(buf + len, s, sl);
+		len += sl;
+		buf[len] = 0;
+	}
+	return mk_str(buf);
+}
+
+static ms_val *bi_num_to_str(ms_val *args) {
+	ms_val *x = ARG1;
+	need_num(x, "num->str");
+	return mk_str((char *)strdup(ms_to_string(x, false)));
+}
+
+static ms_val *bi_str_to_num(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_STR) ms_log(MS_PANIC, "str->num: expected a string");
+	return mk_num(strtod(x->u.str, NULL));
+}
+
+static ms_val *bi_str_append(ms_val *args) {
+	size_t cap = 64, len = 0;
+	char *buf = malloc(cap);
+	buf[0] = 0;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) {
+		ms_val *x = pcar(p);
+		if (x->type != T_STR) ms_log(MS_PANIC, "str-append: expected strings");
+		size_t sl = strlen(x->u.str);
+		if (len + sl + 1 > cap) { while (len + sl + 1 > cap) cap *= 2; buf = realloc(buf, cap); }
+		memcpy(buf + len, x->u.str, sl);
+		len += sl;
+		buf[len] = 0;
+	}
+	return mk_str(buf);
+}
+
+static ms_val *bi_str_len(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_STR) ms_log(MS_PANIC, "str-length: expected a string");
+	return mk_num((double)strlen(x->u.str));
+}
+
+#ifndef LIX
+static ms_val *bi_file_to_str(ms_val *args) {
+	ms_val *x = ARG1;
+	FILE *fp = fopen(x->u.str, "r");
+	if (!fp) ms_log(MS_PANIC, "file not found: %s", x->u.str);
+	fseek(fp, 0L, SEEK_END);
+	long size = ftell(fp);
+	rewind(fp);
+	char *buf = malloc(size + 1);
+	size_t rd = fread(buf, 1, size, fp);
+	buf[rd] = 0;
+	fclose(fp);
+	return mk_str(buf);
+}
+
+static ms_val *bi_load(ms_val *args) {
+	ms_val *x = ARG1;
+	if (x->type != T_STR) ms_log(MS_PANIC, "load: expected a string (filename)");
+	ms_load_file(x->u.str, ms_global_env);
+	return g_true;
+}
+#endif
+
+/* R4RS string procedures beyond what's above */
+static ms_val *bi_make_string(ms_val *args) {
+	need_num(ARG1, "make-string");
+	long n = (long)ARG1->u.num;
+	char fill = nilp(pcdr(args)) ? ' ' : (char)ARG2->u.ch;
+	char *buf = malloc(n + 1);
+	memset(buf, fill, n);
+	buf[n] = 0;
+	return mk_str(buf);
+}
+static ms_val *bi_string(ms_val *args) {
+	long n = list_length(args);
+	char *buf = malloc(n + 1);
+	long i = 0;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) buf[i++] = (char)pcar(p)->u.ch;
+	buf[n] = 0;
+	return mk_str(buf);
+}
+static ms_val *bi_string_ref(ms_val *args) {
+	ms_val *s = ARG1;
+	if (s->type != T_STR) ms_log(MS_PANIC, "string-ref: expected a string");
+	need_num(ARG2, "string-ref");
+	long i = (long)ARG2->u.num;
+	long len = (long)strlen(s->u.str);
+	if (i < 0 || i >= len) ms_log(MS_PANIC, "string-ref: index out of range");
+	return mk_char((unsigned char)s->u.str[i]);
+}
+static ms_val *bi_string_set(ms_val *args) {
+	ms_val *s = ARG1;
+	if (s->type != T_STR) ms_log(MS_PANIC, "string-set!: expected a string");
+	need_num(ARG2, "string-set!");
+	long i = (long)ARG2->u.num;
+	long len = (long)strlen(s->u.str);
+	if (i < 0 || i >= len) ms_log(MS_PANIC, "string-set!: index out of range");
+	s->u.str[i] = (char)ARG3->u.ch;
+	return g_false;
+}
+static ms_val *bi_substring(ms_val *args) {
+	ms_val *s = ARG1;
+	if (s->type != T_STR) ms_log(MS_PANIC, "substring: expected a string");
+	need_num(ARG2, "substring"); need_num(ARG3, "substring");
+	long start = (long)ARG2->u.num, end = (long)ARG3->u.num;
+	long len = (long)strlen(s->u.str);
+	if (start < 0 || end > len || start > end) ms_log(MS_PANIC, "substring: index out of range");
+	char *buf = malloc(end - start + 1);
+	memcpy(buf, s->u.str + start, end - start);
+	buf[end - start] = 0;
+	return mk_str(buf);
+}
+static ms_val *bi_string_copy(ms_val *args) {
+	if (ARG1->type != T_STR) ms_log(MS_PANIC, "string-copy: expected a string");
+	return mk_str(strdup(ARG1->u.str));
+}
+static ms_val *bi_string_fill(ms_val *args) {
+	ms_val *s = ARG1;
+	if (s->type != T_STR) ms_log(MS_PANIC, "string-fill!: expected a string");
+	memset(s->u.str, (char)ARG2->u.ch, strlen(s->u.str));
+	return g_false;
+}
+static int str_cmp(ms_val *args, const char *who) {
+	ms_val *a = ARG1, *b = ARG2;
+	if (a->type != T_STR || b->type != T_STR) ms_log(MS_PANIC, "%s: expected strings", who);
+	return strcmp(a->u.str, b->u.str);
+}
+static ms_val *bi_string_eq(ms_val *args) { return str_cmp(args, "string=?") == 0 ? g_true : g_false; }
+static ms_val *bi_string_lt(ms_val *args) { return str_cmp(args, "string<?") < 0 ? g_true : g_false; }
+static ms_val *bi_string_gt(ms_val *args) { return str_cmp(args, "string>?") > 0 ? g_true : g_false; }
+static ms_val *bi_string_le(ms_val *args) { return str_cmp(args, "string<=?") <= 0 ? g_true : g_false; }
+static ms_val *bi_string_ge(ms_val *args) { return str_cmp(args, "string>=?") >= 0 ? g_true : g_false; }
+static ms_val *bi_string_to_symbol(ms_val *args) {
+	if (ARG1->type != T_STR) ms_log(MS_PANIC, "string->symbol: expected a string");
+	return mk_sym(ARG1->u.str);
+}
+static ms_val *bi_symbol_to_string(ms_val *args) {
+	if (ARG1->type != T_SYM) ms_log(MS_PANIC, "symbol->string: expected a symbol");
+	return mk_str(strdup(ARG1->u.str));
+}
+
+/* number<->string with the R4RS names (aliases of num->str/str->num, plus
+ * an optional radix argument) */
+static ms_val *bi_number_to_string(ms_val *args) {
+	need_num(ARG1, "number->string");
+	if (nilp(pcdr(args)) || (long)ARG2->u.num == 10) return mk_str(strdup(ms_to_string(ARG1, false)));
+	long radix = (long)ARG2->u.num;
+	long n = (long)ARG1->u.num;
+	bool neg = n < 0; if (neg) n = -n;
+	char buf[80]; int i = 80; buf[--i] = 0;
+	if (n == 0) buf[--i] = '0';
+	while (n > 0) { int d = n % radix; buf[--i] = d < 10 ? '0' + d : 'a' + d - 10; n /= radix; }
+	if (neg) buf[--i] = '-';
+	return mk_str(strdup(buf + i));
+}
+static ms_val *bi_string_to_number(ms_val *args) {
+	if (ARG1->type != T_STR) ms_log(MS_PANIC, "string->number: expected a string");
+	long radix = nilp(pcdr(args)) ? 10 : (long)ARG2->u.num;
+	char *end;
+	double v = (radix == 10) ? strtod(ARG1->u.str, &end) : (double)strtol(ARG1->u.str, &end, (int)radix);
+	if (end == ARG1->u.str) return g_false;
+	return mk_num(v);
+}
+
+/* characters */
+static ms_val *bi_char_to_int(ms_val *args) {
+	if (ARG1->type != T_CHAR) ms_log(MS_PANIC, "char->integer: expected a character");
+	return mk_num((double)ARG1->u.ch);
+}
+static ms_val *bi_int_to_char(ms_val *args) { need_num(ARG1, "integer->char"); return mk_char((long)ARG1->u.num); }
+static int char_cmp(ms_val *args, const char *who) {
+	if (ARG1->type != T_CHAR || ARG2->type != T_CHAR) ms_log(MS_PANIC, "%s: expected characters", who);
+	return (int)(ARG1->u.ch - ARG2->u.ch);
+}
+static ms_val *bi_char_eq(ms_val *args) { return char_cmp(args, "char=?") == 0 ? g_true : g_false; }
+static ms_val *bi_char_lt(ms_val *args) { return char_cmp(args, "char<?") < 0 ? g_true : g_false; }
+static ms_val *bi_char_gt(ms_val *args) { return char_cmp(args, "char>?") > 0 ? g_true : g_false; }
+static ms_val *bi_char_le(ms_val *args) { return char_cmp(args, "char<=?") <= 0 ? g_true : g_false; }
+static ms_val *bi_char_ge(ms_val *args) { return char_cmp(args, "char>=?") >= 0 ? g_true : g_false; }
+static ms_val *bi_char_upcase(ms_val *args) { return mk_char(toupper((int)ARG1->u.ch)); }
+static ms_val *bi_char_downcase(ms_val *args) { return mk_char(tolower((int)ARG1->u.ch)); }
+static ms_val *bi_char_alphabetic_p(ms_val *args) { return isalpha((int)ARG1->u.ch) ? g_true : g_false; }
+static ms_val *bi_char_numeric_p(ms_val *args) { return isdigit((int)ARG1->u.ch) ? g_true : g_false; }
+static ms_val *bi_char_whitespace_p(ms_val *args) { return isspace((int)ARG1->u.ch) ? g_true : g_false; }
+static ms_val *bi_char_upper_p(ms_val *args) { return isupper((int)ARG1->u.ch) ? g_true : g_false; }
+static ms_val *bi_char_lower_p(ms_val *args) { return islower((int)ARG1->u.ch) ? g_true : g_false; }
+
+/* vectors */
+static void need_vec(ms_val *v, const char *who) { if (v->type != T_VECTOR) ms_log(MS_PANIC, "%s: expected a vector", who); }
+static ms_val *bi_make_vector(ms_val *args) {
+	need_num(ARG1, "make-vector");
+	return mk_vector((long)ARG1->u.num, nilp(pcdr(args)) ? g_false : ARG2);
+}
+static ms_val *bi_vector(ms_val *args) {
+	long n = list_length(args);
+	PUSH(args);
+	ms_val *v = mk_vector(n, g_false);
+	POP();
+	long i = 0;
+	for (ms_val *p = args; !nilp(p); p = pcdr(p)) v->u.vec.items[i++] = pcar(p);
+	return v;
+}
+static ms_val *bi_vector_length(ms_val *args) { need_vec(ARG1, "vector-length"); return mk_num((double)ARG1->u.vec.len); }
+static ms_val *bi_vector_ref(ms_val *args) {
+	need_vec(ARG1, "vector-ref"); need_num(ARG2, "vector-ref");
+	long i = (long)ARG2->u.num;
+	if (i < 0 || i >= ARG1->u.vec.len) ms_log(MS_PANIC, "vector-ref: index out of range");
+	return ARG1->u.vec.items[i];
+}
+static ms_val *bi_vector_set(ms_val *args) {
+	need_vec(ARG1, "vector-set!"); need_num(ARG2, "vector-set!");
+	long i = (long)ARG2->u.num;
+	if (i < 0 || i >= ARG1->u.vec.len) ms_log(MS_PANIC, "vector-set!: index out of range");
+	ARG1->u.vec.items[i] = ARG3;
+	return g_false;
+}
+static ms_val *bi_vector_fill(ms_val *args) {
+	need_vec(ARG1, "vector-fill!");
+	for (long i = 0; i < ARG1->u.vec.len; i++) ARG1->u.vec.items[i] = ARG2;
+	return g_false;
+}
+static ms_val *bi_vector_to_list(ms_val *args) {
+	need_vec(ARG1, "vector->list");
+	ms_val *head = g_nil, *tail = NULL;
+	PUSH(args); PUSH(head);
+	for (long i = 0; i < ARG1->u.vec.len; i++) {
+		ms_val *cell = mk_pair(ARG1->u.vec.items[i], g_nil);
+		if (tail == NULL) { head = cell; ms_protect_stack[ms_protect_top - 1] = head; }
+		else tail->u.pair.cdr = cell;
+		tail = cell;
+	}
+	POPN(2);
+	return head;
+}
+static ms_val *bi_list_to_vector(ms_val *args) {
+	long n = list_length(ARG1);
+	PUSH(args);
+	ms_val *v = mk_vector(n, g_false);
+	POP();
+	long i = 0;
+	for (ms_val *p = ARG1; !nilp(p); p = pcdr(p)) v->u.vec.items[i++] = pcar(p);
+	return v;
+}
+
+/* memq/memv/assq/assv -- like member/assoc but using eq?/eqv? (here the
+ * same function) instead of equal? */
+static ms_val *bi_memq(ms_val *args) {
+	for (ms_val *p = ARG2; !nilp(p); p = pcdr(p)) if (ms_eq(pcar(p), ARG1)) return p;
+	return g_false;
+}
+static ms_val *bi_assq(ms_val *args) {
+	for (ms_val *p = ARG2; !nilp(p); p = pcdr(p)) if (ms_eq(pcar(pcar(p)), ARG1)) return pcar(p);
+	return g_false;
+}
+
+/* delay / force */
+static ms_val *bi_force(ms_val *args) {
+	ms_val *p = ARG1;
+	if (p->type != T_PROMISE) return p; /* forcing a non-promise: pass through */
+	if (!p->u.promise.forced) {
+		ms_val *v = call_procedure(p->u.promise.thunk, g_nil);
+		if (!p->u.promise.forced) { p->u.promise.value = v; p->u.promise.forced = true; }
+	}
+	return p->u.promise.value;
+}
+
+/* call/cc + dynamic-wind (escape-only continuations -- see README) */
+static ms_val *bi_callcc(ms_val *args) {
+	ms_val *f = ARG1;
+	PUSH(f);
+	ms_val *k = alloc_cell();
+	k->type = T_CONT;
+	k->u.cont = malloc(sizeof(ms_cont_data));
+	k->u.cont->used = false;
+	k->u.cont->wind_depth = ms_wind_top;
+	k->u.cont->result = g_false;
+	PUSH(k);
+	int saved_protect_top = ms_protect_top;
+	ms_val *result;
+	if (setjmp(k->u.cont->buf) == 0) {
+		result = call_procedure(f, mk_pair(k, g_nil));
+		k->u.cont->used = true; /* normal return: can no longer be invoked */
+	} else {
+		ms_protect_top = saved_protect_top;
+		result = k->u.cont->result;
+	}
+	POPN(2);
+	return result;
+}
+
+static ms_val *bi_dynamic_wind(ms_val *args) {
+	ms_val *before = ARG1, *thunk = ARG2, *after = ARG3;
+	call_procedure(before, g_nil);
+	if (ms_wind_top >= MS_MAX_WINDS) ms_log(MS_PANIC, "dynamic-wind: too many nested winds (increase MS_MAX_WINDS)");
+	ms_wind_stack[ms_wind_top].before = before;
+	ms_wind_stack[ms_wind_top].after = after;
+	ms_wind_top++;
+	ms_val *result = call_procedure(thunk, g_nil);
+	ms_wind_top--;
+	call_procedure(after, g_nil);
+	return result;
+}
+
+/* ----------------------------------------------------------------------
+ * ENV SETUP
+ * ------------------------------------------------------------------- */
+
+static void def_builtin(ms_val *env, const char *name, ms_builtin fn) {
+	env_define(env, mk_sym(name), mk_fun(fn));
+}
+
+ms_val *ms_env_std(void) {
+	ms_val *env = ms_new_env(g_nil);
+	PUSH(env); /* not yet reachable via ms_global_env -- see comment above call site */
+
+	def_builtin(env, "car", bi_car);
+	def_builtin(env, "cdr", bi_cdr);
+	def_builtin(env, "cons", bi_cons);
+	def_builtin(env, "set-car!", bi_set_car);
+	def_builtin(env, "set-cdr!", bi_set_cdr);
+	def_builtin(env, "list", bi_list);
+	def_builtin(env, "pair?", bi_pair_p);
+	def_builtin(env, "null?", bi_null_p);
+	def_builtin(env, "atom?", bi_atom_p);
+	def_builtin(env, "number?", bi_num_p);
+	def_builtin(env, "string?", bi_str_p);
+	def_builtin(env, "symbol?", bi_sym_p);
+	def_builtin(env, "boolean?", bi_bool_p);
+	def_builtin(env, "char?", bi_char_p);
+	def_builtin(env, "vector?", bi_vector_p);
+	def_builtin(env, "procedure?", bi_proc_p);
+	def_builtin(env, "eof-object?", bi_eof_object_p);
+	def_builtin(env, "length", bi_length);
+
+	def_builtin(env, "eq?", bi_eq);
+	def_builtin(env, "eqv?", bi_eq);
+	def_builtin(env, "equal?", bi_equal);
+	def_builtin(env, "not", bi_not);
+
+	def_builtin(env, "<", bi_lt);
+	def_builtin(env, "<=", bi_lte);
+	def_builtin(env, ">", bi_gt);
+	def_builtin(env, ">=", bi_gte);
+	def_builtin(env, "=", bi_numeq);
+
+	def_builtin(env, "+", bi_add);
+	def_builtin(env, "-", bi_sub);
+	def_builtin(env, "*", bi_mul);
+	def_builtin(env, "/", bi_div);
+	def_builtin(env, "%", bi_mod);
+	def_builtin(env, "mod", bi_mod);
+	def_builtin(env, "quotient", bi_quotient);
+	def_builtin(env, "remainder", bi_remainder);
+	def_builtin(env, "modulo", bi_modulo);
+	def_builtin(env, "gcd", bi_gcd);
+	def_builtin(env, "lcm", bi_lcm);
+	def_builtin(env, "expt", bi_expt);
+	def_builtin(env, "abs", bi_abs);
+	def_builtin(env, "floor", bi_floor);
+	def_builtin(env, "ceiling", bi_ceiling);
+	def_builtin(env, "truncate", bi_truncate);
+	def_builtin(env, "round", bi_round);
+	def_builtin(env, "sqrt", bi_sqrt);
+	def_builtin(env, "min", bi_min);
+	def_builtin(env, "max", bi_max);
+	def_builtin(env, "zero?", bi_zero_p);
+	def_builtin(env, "positive?", bi_positive_p);
+	def_builtin(env, "negative?", bi_negative_p);
+	def_builtin(env, "odd?", bi_odd_p);
+	def_builtin(env, "even?", bi_even_p);
+	def_builtin(env, "exact?", bi_exact_p);
+	def_builtin(env, "inexact?", bi_inexact_p);
+	def_builtin(env, "exact->inexact", bi_exact_to_inexact);
+	def_builtin(env, "inexact->exact", bi_inexact_to_exact);
+
+	def_builtin(env, "apply", bi_apply);
+	def_builtin(env, "eval", bi_eval);
+	def_builtin(env, "read", bi_read);
+	def_builtin(env, "force", bi_force);
+	def_builtin(env, "call/cc", bi_callcc);
+	def_builtin(env, "call-with-current-continuation", bi_callcc);
+	def_builtin(env, "dynamic-wind", bi_dynamic_wind);
+
+	def_builtin(env, "print", bi_print);
+	def_builtin(env, "display", bi_display);
+	def_builtin(env, "write", bi_write);
+	def_builtin(env, "gc", bi_gc);
+	def_builtin(env, "exit", bi_exit);
+
+	def_builtin(env, "str->list", bi_str_to_list);
+	def_builtin(env, "list->str", bi_list_to_str);
+	def_builtin(env, "num->str", bi_num_to_str);
+	def_builtin(env, "str->num", bi_str_to_num);
+	def_builtin(env, "str-append", bi_str_append);
+	def_builtin(env, "string-append", bi_str_append);
+	def_builtin(env, "str-length", bi_str_len);
+	def_builtin(env, "number->string", bi_number_to_string);
+	def_builtin(env, "string->number", bi_string_to_number);
+	def_builtin(env, "string->symbol", bi_string_to_symbol);
+	def_builtin(env, "symbol->string", bi_symbol_to_string);
+	def_builtin(env, "make-string", bi_make_string);
+	def_builtin(env, "string", bi_string);
+	def_builtin(env, "string-length", bi_str_len);
+	def_builtin(env, "string-ref", bi_string_ref);
+	def_builtin(env, "string-set!", bi_string_set);
+	def_builtin(env, "substring", bi_substring);
+	def_builtin(env, "string-copy", bi_string_copy);
+	def_builtin(env, "string-fill!", bi_string_fill);
+	def_builtin(env, "string=?", bi_string_eq);
+	def_builtin(env, "string<?", bi_string_lt);
+	def_builtin(env, "string>?", bi_string_gt);
+	def_builtin(env, "string<=?", bi_string_le);
+	def_builtin(env, "string>=?", bi_string_ge);
+
+	def_builtin(env, "char->integer", bi_char_to_int);
+	def_builtin(env, "integer->char", bi_int_to_char);
+	def_builtin(env, "char=?", bi_char_eq);
+	def_builtin(env, "char<?", bi_char_lt);
+	def_builtin(env, "char>?", bi_char_gt);
+	def_builtin(env, "char<=?", bi_char_le);
+	def_builtin(env, "char>=?", bi_char_ge);
+	def_builtin(env, "char-upcase", bi_char_upcase);
+	def_builtin(env, "char-downcase", bi_char_downcase);
+	def_builtin(env, "char-alphabetic?", bi_char_alphabetic_p);
+	def_builtin(env, "char-numeric?", bi_char_numeric_p);
+	def_builtin(env, "char-whitespace?", bi_char_whitespace_p);
+	def_builtin(env, "char-upper-case?", bi_char_upper_p);
+	def_builtin(env, "char-lower-case?", bi_char_lower_p);
+
+	def_builtin(env, "make-vector", bi_make_vector);
+	def_builtin(env, "vector", bi_vector);
+	def_builtin(env, "vector-length", bi_vector_length);
+	def_builtin(env, "vector-ref", bi_vector_ref);
+	def_builtin(env, "vector-set!", bi_vector_set);
+	def_builtin(env, "vector-fill!", bi_vector_fill);
+	def_builtin(env, "vector->list", bi_vector_to_list);
+	def_builtin(env, "list->vector", bi_list_to_vector);
+
+	def_builtin(env, "memq", bi_memq);
+	def_builtin(env, "memv", bi_memq);
+	def_builtin(env, "assq", bi_assq);
+	def_builtin(env, "assv", bi_assq);
+
+#ifndef LIX
+	def_builtin(env, "file->str", bi_file_to_str);
+	def_builtin(env, "load", bi_load);
+#endif
+
+	POP();
+	return env;
+}
+
+void ms_init(void) {
+	ms_heap_live = 0;
+	ms_freelist = NULL;
+	for (long i = MS_HEAP_SIZE - 1; i >= 0; i--) {
+		ms_heap[i].type = T_FREE;
+		ms_heap[i].u.pair.cdr = ms_freelist;
+		ms_freelist = &ms_heap[i];
+	}
+	ms_symbols = NULL;
+	ms_protect_top = 0;
+	ms_wind_top = 0;
+
+	/* g_nil/g_true/g_false/g_unassigned/g_eof are permanent singletons;
+	 * protect them forever by pushing them at the bottom of the protect
+	 * stack (this also makes gc_mark reachable-from-roots work even
+	 * before ms_global_env exists). */
+	g_nil = alloc_cell();
+	g_nil->type = T_NIL;
+	PUSH(g_nil);
+
+	g_true = alloc_cell();
+	g_true->type = T_BOOL;
+	PUSH(g_true);
+
+	g_false = alloc_cell();
+	g_false->type = T_BOOL;
+	PUSH(g_false);
+
+	g_unassigned = alloc_cell();
+	g_unassigned->type = T_SYM;
+	g_unassigned->u.str = (char *)malloc(1);
+	g_unassigned->u.str[0] = 0;
+	PUSH(g_unassigned);
+
+	g_eof = alloc_cell();
+	g_eof->type = T_SYM;
+	g_eof->u.str = (char *)malloc(1);
+	g_eof->u.str[0] = 0;
+	PUSH(g_eof);
+
+	sym_quote = mk_sym("quote");
+	sym_if = mk_sym("if");
+	sym_cond = mk_sym("cond");
+	sym_begin = mk_sym("begin");
+	sym_lambda = mk_sym("lambda");
+	sym_define = mk_sym("define");
+	sym_defun = mk_sym("defun");
+	sym_let = mk_sym("let");
+	sym_letstar = mk_sym("let*");
+	sym_letrec = mk_sym("letrec");
+	sym_set = mk_sym("set!");
+	sym_and = mk_sym("and");
+	sym_or = mk_sym("or");
+	sym_while = mk_sym("while");
+	sym_quasiquote = mk_sym("quasiquote");
+	sym_unquote = mk_sym("unquote");
+	sym_unquote_splicing = mk_sym("unquote-splicing");
+	sym_do = mk_sym("do");
+	sym_case = mk_sym("case");
+	sym_delay = mk_sym("delay");
+	sym_else = mk_sym("else");
+	sym_arrow = mk_sym("=>");
+
+	ms_global_env = ms_env_std();
+	env_define(ms_global_env, mk_sym("nil"), g_nil);
+	env_define(ms_global_env, mk_sym("t"), g_true);
+	env_define(ms_global_env, mk_sym("true"), g_true);
+	env_define(ms_global_env, mk_sym("false"), g_false);
+}
+
+#ifdef LIX
+void ms_init_lix(bool stdlib) {
+	ms_init();
+	if (stdlib) ms_load_string((const char *)ms_stdlib_l, ms_global_env);
+}
+#endif
+
+/* ----------------------------------------------------------------------
+ * REPL / MAIN (desktop build only)
+ * ------------------------------------------------------------------- */
+
+#ifndef LIX
+
+#ifdef MS_USE_READLINE
+#include <readline/readline.h>
+#include <readline/history.h>
+#endif
+
+/* Tracks whether `buf` contains a "complete" read: parens balanced and
+ * not mid-string-literal, so the REPL knows whether to keep prompting
+ * for more lines or go ahead and parse/evaluate what it has. Comments
+ * and string escapes are honored so a `;` or an escaped quote inside a
+ * string doesn't confuse the depth count. */
+static bool input_is_complete(const char *s) {
+	int depth = 0;
+	bool in_str = false;
+	for (const char *p = s; *p; p++) {
+		if (in_str) {
+			if (*p == '\\' && p[1]) { p++; continue; }
+			if (*p == '"') in_str = false;
+			continue;
+		}
+		if (*p == ';') { while (*p && *p != '\n') p++; if (!*p) break; continue; }
+		if (*p == '"') { in_str = true; continue; }
+		if (*p == '(') depth++;
+		else if (*p == ')') { if (depth > 0) depth--; }
+	}
+	return depth <= 0 && !in_str;
+}
+
+static bool input_has_content(const char *s) {
+	for (const char *p = s; *p; p++)
+		if (!isspace((unsigned char)*p)) return true;
+	return false;
+}
+
+/* Reads one line of input, always returning a malloc'd, NUL-terminated
+ * buffer with a trailing '\n' (or NULL at EOF) so the rest of the REPL
+ * doesn't need to care whether readline or plain getline() supplied it.
+ *
+ * With -DMS_USE_READLINE: uses GNU readline for arrow-key editing and
+ * command history (added per non-empty line). This is opt-in specifically
+ * so the default build -- including the embedded/LIX target -- never
+ * requires linking against readline.
+ *
+ * Without it: getline(), which still has no fixed line-length limit; you
+ * just don't get history/arrow-key recall (piping through `rlwrap` is a
+ * lightweight way to get that without a build-time dependency). */
+static char *read_one_line(const char *prompt) {
+#ifdef MS_USE_READLINE
+	char *rl = readline(prompt);
+	if (rl == NULL) return NULL; /* EOF (Ctrl-D) */
+	if (rl[0] != '\0') add_history(rl);
+	size_t len = strlen(rl);
+	char *buf = malloc(len + 2);
+	memcpy(buf, rl, len);
+	buf[len] = '\n';
+	buf[len + 1] = '\0';
+	free(rl);
+	return buf;
+#else
+	printf("%s", prompt);
+	fflush(stdout);
+	char *line = NULL;
+	size_t cap = 0;
+	ssize_t n = getline(&line, &cap, stdin);
+	if (n < 0) { free(line); return NULL; }
+	return line; /* getline NUL-terminates and keeps the trailing '\n' */
+#endif
+}
+
+static void repl(ms_val *env) {
+	char *acc = NULL;    /* accumulated (possibly multi-line) input */
+	size_t acclen = 0, acccap = 0;
+
+	for (;;) {
+		char *line = read_one_line(acclen ? "...  " : "ms> ");
+		if (line == NULL) { /* EOF */
+			if (acclen) printf("\n");
+			break;
+		}
+
+		size_t n = strlen(line);
+		size_t need = acclen + n + 1;
+		if (need > acccap) {
+			acccap = need < 256 ? 256 : need * 2;
+			acc = realloc(acc, acccap);
+		}
+		memcpy(acc + acclen, line, n + 1);
+		acclen += n;
+		free(line);
+
+		if (!input_has_content(acc)) { acclen = 0; continue; }
+		if (!input_is_complete(acc)) continue; /* prompt for more lines */
+
+		const char *p = acc;
+		for (;;) {
+			ms_val *form = ms_read(&p);
+			if (form == NULL) break;
+			PUSH(form);
+			ms_val *r = ms_eval(form, env);
+			POP();
+			ms_print(r, true);
+			printf("\n");
+		}
+		acclen = 0;
+	}
+
+	free(acc);
+}
+
+int main(int argc, char **argv) {
+	ms_init();
+	if (argc > 1) {
+		for (int i = 1; i < argc; i++) ms_load_file(argv[i], ms_global_env);
+		return 0;
+	}
+	repl(ms_global_env);
+	return 0;
+}
+#endif /* !LIX */
