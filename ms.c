@@ -53,8 +53,7 @@
 #include <setjmp.h>
 
 #ifdef LIX
-#include "include/fs.h"
-#include "../common/zucker.h"
+#include "fs.h"
 #include "ms_stdlib.h"
 #endif
 
@@ -145,13 +144,13 @@ typedef enum { MS_INFO, MS_ERROR, MS_PANIC } ms_log_level;
  * GLOBALS
  * ------------------------------------------------------------------- */
 
-static ms_val ms_heap[MS_HEAP_SIZE];
+static ms_val *ms_heap = NULL;
 static ms_val *ms_freelist = NULL;
 static long ms_heap_live = 0;
 
 static ms_val *ms_symbols = NULL; /* intern list, linked through u.pair, car=sym cdr=rest */
 
-static ms_val *ms_protect_stack[MS_PROTECT_STACK_SIZE];
+static ms_val **ms_protect_stack = NULL;
 static int ms_protect_top = 0;
 
 static ms_val *g_nil;
@@ -203,22 +202,38 @@ static ms_val *pcar(ms_val *v);
 static ms_val *pcdr(ms_val *v);
 static bool nilp(ms_val *v);
 static bool truthy(ms_val *v);
-static ms_val *ms_eval(ms_val *x, ms_val *env);
+ms_val *ms_eval(ms_val *x, ms_val *env);
 static ms_val *env_lookup(ms_val *env, ms_val *sym);
 static void env_define(ms_val *env, ms_val *sym, ms_val *val);
 static bool env_set(ms_val *env, ms_val *sym, ms_val *val);
 static ms_val *ms_new_env(ms_val *parent);
 static bool ms_equal(ms_val *a, ms_val *b);
-static ms_val *ms_read(const char **s);
-static void ms_print(ms_val *v, bool readable);
+ms_val *ms_read(const char **s);
+void ms_print(ms_val *v, bool readable);
 static char *ms_to_string(ms_val *v, bool readable);
-static void ms_load_string(const char *src, ms_val *env);
+void ms_load_string(const char *src, ms_val *env);
 #ifndef LIX
 static void ms_load_file(const char *filename, ms_val *env);
 #endif
 static ms_val *qq_expand(ms_val *t, ms_val *env);
 ms_val *ms_env_std(void);
 void ms_init(void);
+void ms_deinit(void);	/* frees the heap/protect stack malloc'd by
+						 * ms_init(); not part of upstream ms.c -- added
+						 * so an embedding caller can reclaim this RAM
+						 * when the interpreter isn't in use */
+
+/* opt-in panic recovery -- not part of upstream ms.c; see the full
+ * explanation and correct usage pattern near ms_log() below. setjmp()
+ * on ms_panic_recovery must be called directly by the embedding
+ * caller, not through a wrapper function. */
+extern jmp_buf ms_panic_recovery;
+extern bool ms_panic_recovery_armed;
+extern bool ms_exit_requested;
+extern int ms_exit_code;
+void ms_panic_before_try(void);
+void ms_panic_after_recover(void);
+void ms_panic_disarm(void);
 
 #define PUSH(v) \
 	do { \
@@ -237,6 +252,51 @@ void ms_init(void);
  * LOGGING
  * ------------------------------------------------------------------- */
 
+/* Opt-in panic recovery -- NOT part of upstream ms.c. A panic
+ * (type errors, heap exhaustion, protect-stack overflow, calling a
+ * non-procedure, etc.) is the COMMON case for an interactive REPL,
+ * not a rare failure -- a single typo like (car 5) would otherwise
+ * exit() the whole process.
+ *
+ * IMPORTANT: setjmp(ms_panic_recovery) must be called DIRECTLY by the
+ * embedding caller, in the same stack frame that will go on to call
+ * ms_eval() -- NOT wrapped in a helper function that returns before
+ * the protected work runs. longjmp() can only target a setjmp() whose
+ * enclosing stack frame is still live; a helper that calls setjmp()
+ * and then returns has already destroyed that frame by the time a
+ * later panic tries to jump back into it (this exact mistake was
+ * caught by testing against a real (car 5) panic: ms_log's longjmp
+ * call executed, but landed in an exited frame, silently continuing
+ * into undefined behavior -- a non-pair being read as a pair's car --
+ * rather than either recovering correctly or crashing loudly).
+ *
+ * Correct usage, directly in the caller's own stack frame:
+ *
+ *     ms_panic_before_try();
+ *     if (setjmp(ms_panic_recovery) == 0) {
+ *         // normal path: ms_read()/ms_eval()/ms_print() here
+ *     } else {
+ *         ms_panic_after_recover();
+ *         // a panic occurred; report it and continue
+ *     }
+ *
+ * Both helpers reset ms_protect_top/ms_wind_top back to their depth
+ * at ms_panic_before_try() time, the same way call/cc already resets
+ * its own bookkeeping on escape, so a panic can never leak
+ * protect-stack slots or dangling dynamic-wind frames across repeated
+ * recoveries. When ms_panic_recovery_armed is false (e.g. the desktop
+ * REPL, or upstream's own test suite, which never call
+ * ms_panic_before_try() at all), ms_log's behavior on a panic is
+ * byte-for-byte identical to the original: exit(EXIT_FAILURE). */
+jmp_buf ms_panic_recovery;
+bool ms_panic_recovery_armed = false;
+static int ms_panic_saved_protect_top = 0;
+static int ms_panic_saved_wind_top = 0;
+bool ms_exit_requested = false;	/* set by (exit) when longjmp'ing back
+									 * via code 2 instead of really
+									 * exiting -- see bi_exit() */
+int ms_exit_code = 0;
+
 static void ms_log(ms_log_level level, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
@@ -246,7 +306,28 @@ static void ms_log(ms_log_level level, const char *fmt, ...) {
 	vfprintf(stderr, fmt, args);
 	fprintf(stderr, "\n");
 	va_end(args);
-	if (level == MS_PANIC) exit(EXIT_FAILURE);
+	if (level == MS_PANIC) {
+		if (ms_panic_recovery_armed) {
+			longjmp(ms_panic_recovery, 1);
+		} else {
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
+void ms_panic_before_try(void) {
+	ms_panic_saved_protect_top = ms_protect_top;
+	ms_panic_saved_wind_top = ms_wind_top;
+	ms_panic_recovery_armed = true;
+}
+
+void ms_panic_after_recover(void) {
+	ms_protect_top = ms_panic_saved_protect_top;
+	ms_wind_top = ms_panic_saved_wind_top;
+}
+
+void ms_panic_disarm(void) {
+	ms_panic_recovery_armed = false;
 }
 
 /* ----------------------------------------------------------------------
@@ -663,7 +744,7 @@ static void ms_print_inner(ms_val *v, bool readable) {
 	}
 }
 
-static void ms_print(ms_val *v, bool readable) { ms_print_inner(v, readable); }
+void ms_print(ms_val *v, bool readable) { ms_print_inner(v, readable); }
 
 /* render into a malloc'd string (used by (write-to-string x) style helpers) */
 static void tostr_inner(ms_val *v, bool readable, char **buf, size_t *len, size_t *cap);
@@ -774,7 +855,7 @@ static bool token_is_number(const char *tok) {
 	return digits;
 }
 
-static ms_val *ms_read(const char **s) {
+ms_val *ms_read(const char **s) {
 
 	skip_ws(s);
 	if (**s == 0) return NULL; /* end of input */
@@ -1461,7 +1542,7 @@ static ms_val *qq_expand(ms_val *t, ms_val *env) {
  * LOAD (source is entirely in-memory; no fopen on LIX)
  * ------------------------------------------------------------------- */
 
-static void ms_load_string(const char *src, ms_val *env) {
+void ms_load_string(const char *src, ms_val *env) {
 	const char *p = src;
 	for (;;) {
 		ms_val *form = ms_read(&p);
@@ -1708,6 +1789,65 @@ static ms_val *bi_apply(ms_val *args) {
 
 static ms_val *bi_eval(ms_val *args) { return ms_eval(ARG1, ms_global_env); }
 
+/* (dump) -- prints every symbol currently bound in the global
+ * environment, wrapped at 80 columns, and returns #t (matching
+ * bi_gc()'s own convention just above: a side-effecting diagnostic,
+ * not a value meant for further computation). Environments are built
+ * entirely from ordinary pairs (see ms_new_env()/env_lookup() above):
+ * env is (frame . parent), frame is a list of (symbol . value)
+ * bindings. The global env has no parent frames to walk through
+ * (nothing above it), but the outer while loop is kept anyway to stay
+ * correct if that ever changes.
+ *
+ * Deliberately done entirely in C rather than walking the list from
+ * Scheme (e.g. via a Scheme-level for-each over a returned list, as
+ * an earlier revision of this did): with the stdlib loaded, the
+ * environment holds close to 200 bound symbols, and iterating that
+ * many elements from Scheme through non-tail Scheme calls consumed
+ * enough of the protect stack (see ms_protect_stack/
+ * MS_PROTECT_STACK_SIZE above) to overflow it on a memory-constrained
+ * embedded build. A plain C loop touches none of that -- symbol names
+ * are read directly off T_SYM's own u.str, with no Scheme evaluation
+ * involved in the walk or the printing at all. */
+static ms_val *bi_dump(ms_val *args) {
+
+	(void)args;
+
+	long col = 0;
+
+	ms_val *env = ms_global_env;
+	while (env && env->type == T_PAIR) {
+		ms_val *frame = env->u.pair.car;
+		while (frame && frame->type == T_PAIR) {
+
+			ms_val *binding = frame->u.pair.car;
+			const char *name = binding->u.pair.car->u.str;
+			long len = (long)strlen(name);
+			long need = (col == 0) ? len : (col + 1 + len);
+
+			if (need > 80) {
+				if (col > 0) fputs("\r\n", stdout);
+				fputs(name, stdout);
+				col = len;
+			} else {
+				if (col > 0) fputs(" ", stdout);
+				fputs(name, stdout);
+				col = need;
+			}
+
+			frame = frame->u.pair.cdr;
+
+		}
+		env = env->u.pair.cdr;
+	}
+
+	fputs("\r\n", stdout);
+	fflush(stdout);
+
+	return g_true;
+
+}
+
 static ms_val *bi_read(ms_val *args) {
 	ms_val *x = ARG1;
 	if (x->type != T_STR) ms_log(MS_PANIC, "read: expected a string");
@@ -1740,7 +1880,13 @@ static ms_val *bi_gc(ms_val *args) {
 }
 
 static ms_val *bi_exit(ms_val *args) {
-	exit(nilp(args) ? 0 : (int)ARG1->u.num);
+	int code = nilp(args) ? 0 : (int)ARG1->u.num;
+	if (ms_panic_recovery_armed) {
+		ms_exit_requested = true;
+		ms_exit_code = code;
+		longjmp(ms_panic_recovery, 2);
+	}
+	exit(code);
 }
 
 static ms_val *bi_str_to_list(ms_val *args) {
@@ -2154,6 +2300,7 @@ ms_val *ms_env_std(void) {
 
 	def_builtin(env, "apply", bi_apply);
 	def_builtin(env, "eval", bi_eval);
+	def_builtin(env, "dump", bi_dump);
 	def_builtin(env, "read", bi_read);
 	def_builtin(env, "force", bi_force);
 	def_builtin(env, "call/cc", bi_callcc);
@@ -2230,6 +2377,8 @@ ms_val *ms_env_std(void) {
 }
 
 void ms_init(void) {
+	if (!ms_heap) ms_heap = malloc(MS_HEAP_SIZE * sizeof(ms_val));
+	if (!ms_protect_stack) ms_protect_stack = malloc(MS_PROTECT_STACK_SIZE * sizeof(ms_val *));
 	ms_heap_live = 0;
 	ms_freelist = NULL;
 	for (long i = MS_HEAP_SIZE - 1; i >= 0; i--) {
@@ -2297,6 +2446,19 @@ void ms_init(void) {
 	env_define(ms_global_env, mk_sym("t"), g_true);
 	env_define(ms_global_env, mk_sym("true"), g_true);
 	env_define(ms_global_env, mk_sym("false"), g_false);
+}
+
+void ms_deinit(void) {
+	free(ms_heap);
+	free(ms_protect_stack);
+	ms_heap = NULL;
+	ms_protect_stack = NULL;
+	ms_global_env = NULL;
+	ms_symbols = NULL;
+	ms_freelist = NULL;
+	ms_heap_live = 0;
+	ms_protect_top = 0;
+	ms_wind_top = 0;
 }
 
 #ifdef LIX

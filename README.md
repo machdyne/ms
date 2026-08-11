@@ -379,8 +379,7 @@ gcc -DLIX -DMS_HEAP_SIZE=1500 -DMS_PROTECT_STACK_SIZE=128 \
 ```
 
 Your platform must provide the headers the original LIX integration
-expected (`include/fs.h`, `../common/zucker.h`) and an `ms_stdlib.h` that
-defines:
+expected (`include/fs.h`) and an `ms_stdlib.h` that defines:
 
 ```c
 static const char ms_stdlib_l[] = "...(your stdlib source, or a trimmed"
@@ -400,6 +399,103 @@ calls; it can't run real firmware, so exercise your actual target build too.
 
 `call/cc`/`dynamic-wind` use standard C `setjmp.h`, which is available
 on essentially every embedded toolchain, so they work under `-DLIX` too.
+
+### Session lifecycle
+
+The cell heap and protect stack are `malloc`'d once, lazily, the first
+time `ms_init()` (and therefore `ms_init_lix()`) runs -- not a
+compile-time static array. `MS_HEAP_SIZE`/`MS_PROTECT_STACK_SIZE` still
+fix their *size* at compile time; only the underlying storage moved to
+the heap, specifically so it can be freed:
+
+```c
+void ms_deinit(void);   /* frees the heap and protect stack, resets
+                          * all interpreter state to uninitialized */
+```
+
+Call this when you want to reclaim the RAM while the interpreter isn't
+in use -- e.g. a device that only needs Scheme while a particular menu
+or mode is active. `ms_init_lix()` is safe to call again afterward and
+will re-`malloc` and reload the standard library from scratch.
+
+`ms_init_lix()` is also idempotent while a session is already up: if
+you call it again without an intervening `ms_deinit()`, it does
+nothing rather than re-initializing (which would otherwise silently
+wipe every definition a running session had accumulated, since a
+non-lazy re-init would reset the environment and symbol table even
+though the heap itself was still allocated). If you want a full reset
+of a live session, call `ms_deinit()` first, then `ms_init_lix()`
+again.
+
+### Panic recovery
+
+By default, any runtime error severe enough to be logged at
+`MS_PANIC` level (type errors, heap exhaustion, protect-stack
+overflow, calling a non-procedure, and so on) calls `exit(EXIT_FAILURE)`
+— fine for a one-shot script, fatal for an interactive REPL, where a
+single typo like `(car 5)` would otherwise take down the whole
+process. Opt in to recovering instead:
+
+```c
+extern jmp_buf ms_panic_recovery;
+extern bool ms_panic_recovery_armed;
+void ms_panic_before_try(void);
+void ms_panic_after_recover(void);
+void ms_panic_disarm(void);
+```
+
+Correct usage, once per top-level thing you evaluate (e.g. once per
+line typed at a REPL prompt):
+
+```c
+ms_panic_before_try();
+if (setjmp(ms_panic_recovery) == 0) {
+    /* normal path: ms_read()/ms_eval()/ms_print() here */
+} else {
+    ms_panic_after_recover();
+    /* a panic occurred; it's already been logged, react as needed */
+}
+```
+
+**`setjmp(ms_panic_recovery)` must be called directly by your code, in
+the same stack frame that goes on to call `ms_eval()`** — never inside
+a helper function that sets up the jump and then returns before the
+protected work runs. `longjmp()` can only target a `setjmp()` whose
+enclosing stack frame is still live; a helper that calls `setjmp()`
+and then returns has already destroyed that frame by the time a later
+panic tries to jump back into it, which doesn't fail loudly — it lands
+in an exited frame and continues into undefined behavior instead. This
+is worth stating plainly because it's an easy mistake to make and a
+hard one to diagnose after the fact.
+
+`ms_panic_before_try()`/`ms_panic_after_recover()` also save and
+restore the protect stack and `dynamic-wind` depth around the
+protected call, the same way `call/cc` already resets its own
+bookkeeping on an escape — so a panic can never leak protect-stack
+slots or dangling wind frames across repeated recoveries, however many
+times your REPL loops. Call `ms_panic_disarm()` if you need to
+temporarily go back to the default (real `exit()`) behavior; when
+`ms_panic_recovery_armed` is false — including if you never call
+`ms_panic_before_try()` at all — panic behavior is byte-for-byte
+identical to unpatched upstream.
+
+With recovery armed, Scheme-level `(exit)` no longer really exits
+either: it `longjmp`s back to the same `ms_panic_recovery` point
+(distinguishable from a genuine panic by checking `ms_exit_requested`
+after the jump, with the requested code in `ms_exit_code`), so a
+user's `(exit)` call ends their Scheme session rather than your whole
+embedding process.
+
+### Introspection
+
+```c
+long ms_gc_live_count(void);   /* cells currently live */
+long ms_gc_heap_size(void);    /* MS_HEAP_SIZE, for convenience */
+```
+
+Handy for surfacing memory pressure to a user directly (e.g. an `info`
+or `(gc)` command), rather than only finding out via a clean
+out-of-memory panic.
 
 ## Sizing the heap for small targets
 
