@@ -210,7 +210,15 @@ static ms_val *ms_new_env(ms_val *parent);
 static bool ms_equal(ms_val *a, ms_val *b);
 ms_val *ms_read(const char **s);
 void ms_print(ms_val *v, bool readable);
-static char *ms_to_string(ms_val *v, bool readable);
+char *ms_to_string(ms_val *v, bool readable);	/* NOT static upstream --
+	 * exposed so an embedder can get the printed representation of a
+	 * value as a malloc'd string, without ms_print()'s hardcoded
+	 * printf()-to-stdout (irrelevant/wrong on a target where "stdout"
+	 * isn't necessarily where the result should go -- e.g. Zeitlos's
+	 * `lisp` app, sw/apps/lisp/lisp.c, needs it as a string to send
+	 * down a port or a LISP_EVAL reply message, not printed to its
+	 * own UART debug console). Caller owns the returned string, must
+	 * free() it. */
 void ms_load_string(const char *src, ms_val *env);
 #ifndef LIX
 static void ms_load_file(const char *filename, ms_val *env);
@@ -649,10 +657,71 @@ static bool env_set(ms_val *env, ms_val *sym, ms_val *val) {
  * PRINTING
  * ------------------------------------------------------------------- */
 
+/* NOT part of upstream ms.c. Formats a whole-number double as decimal
+ * text WITHOUT ever casting it to (or passing it as) a `long long`.
+ *
+ * Why: on this project's actual RV32I target (Zeitlos,
+ * -mabi=ilp32 -- no hardware float, so under a pure soft-float ABI a
+ * `long long` and a `double` are passed to a variadic function
+ * exactly the same way, both as an 8-byte value split across the
+ * integer-register/stack argument path), `printf("%lld", (long long)
+ * 3.0)` was observed to print 12884901888 -- exactly 3 << 32, the
+ * textbook signature of a 64-bit variadic argument's two 32-bit
+ * halves ending up swapped or offset by one register slot, not a
+ * logic bug in ms's own arithmetic (the value 3 is present and
+ * correctly positioned in ONE of the two halves, just the wrong one).
+ * Reproduced via lisp.c's `scheme` command (sw/apps/lisp/lisp.c,
+ * Zeitlos), which calls ms_to_string() -> tostr_inner() -> exactly
+ * this code path.
+ *
+ * The fix sidesteps the whole question of exactly which layer is at
+ * fault (this toolchain's variadic long-long marshaling specifically,
+ * vs. something in the double-to-int64 conversion itself feeding it)
+ * by never materializing or passing a 64-bit integer at all: digits
+ * are extracted one at a time with fmod()/floor(), staying entirely
+ * in `double` and single-digit `int` (32-bit, one register, no
+ * marshaling ambiguity possible) the whole way. fmod()/floor() on an
+ * operand that's already an exact integer within a double's 53-bit
+ * exact-integer range (guaranteed here by the `fabs(d) < 1e15` guard
+ * at both call sites, matching upstream's own existing bound) are
+ * exact per IEEE 754, so this produces the same output as a correct
+ * %lld would have, just without ever forming the value that
+ * particular formatting path couldn't reliably deliver on this
+ * target. */
+static void ms_num_to_str(double d, char *out, size_t out_cap) {
+
+	size_t pos = 0;
+	bool neg = (d < 0);
+	if (neg) d = -d;
+
+	char digits[24];
+	int ndigits = 0;
+
+	if (d < 1.0) {
+		digits[ndigits++] = '0';
+	} else {
+		while (d >= 0.5 && ndigits < (int)sizeof(digits)) {
+			int digit = (int)(fmod(d, 10.0) + 0.5);
+			if (digit > 9) digit = 9; // clamp -- shouldn't be
+				// reachable for a genuine exact-integer double, kept
+				// as a safety net rather than trusted to never fire
+			digits[ndigits++] = (char)('0' + digit);
+			d = floor(d / 10.0);
+		}
+	}
+
+	if (neg && pos + 1 < out_cap) out[pos++] = '-';
+	while (ndigits > 0 && pos + 1 < out_cap) out[pos++] = digits[--ndigits];
+	if (pos < out_cap) out[pos] = 0;
+
+}
+
 static void print_double(double d) {
-	if (d == (long long)d && fabs(d) < 1e15)
-		printf("%lld", (long long)d);
-	else
+	if (d == (long long)d && fabs(d) < 1e15) {
+		char buf[24];
+		ms_num_to_str(d, buf, sizeof(buf));
+		printf("%s", buf);
+	} else
 		printf("%g", d);
 }
 
@@ -775,7 +844,11 @@ static void tostr_inner(ms_val *v, bool readable, char **buf, size_t *len, size_
 		}
 		case T_NUM:
 			if (v->u.num == (long long)v->u.num && fabs(v->u.num) < 1e15)
-				snprintf(num, sizeof(num), "%lld", (long long)v->u.num);
+				ms_num_to_str(v->u.num, num, sizeof(num));	// NOT
+					// snprintf(..., "%lld", (long long)v->u.num) --
+					// see ms_num_to_str()'s own comment, this is the
+					// exact call site that produced 12884901888 for
+					// (+ 1 2) via lisp.c's `scheme` command
 			else
 				snprintf(num, sizeof(num), "%g", v->u.num);
 			tostr_append(buf, len, cap, num);
@@ -818,7 +891,9 @@ static void tostr_inner(ms_val *v, bool readable, char **buf, size_t *len, size_
 	}
 }
 
-static char *ms_to_string(ms_val *v, bool readable) {
+char *ms_to_string(ms_val *v, bool readable) {	/* see the public API
+	 * declaration above for why this isn't static upstream, in this
+	 * build */
 	size_t cap = 64, len = 0;
 	char *buf = malloc(cap);
 	buf[0] = 0;
@@ -2376,9 +2451,43 @@ ms_val *ms_env_std(void) {
 	return env;
 }
 
+#ifdef MS_STATIC_HEAP
+/* NOT part of upstream ms.c. Compile-time-sized static arrays instead
+ * of ms_init()'s own malloc(MS_HEAP_SIZE * sizeof(ms_val)) /
+ * malloc(MS_PROTECT_STACK_SIZE * sizeof(ms_val *)) -- opt-in via this
+ * macro, upstream's own malloc-based behavior is completely unchanged
+ * when it's left undefined.
+ *
+ * Why this exists: on a target where a process's total memory is
+ * fixed at CREATION time from its own binary's static footprint (see
+ * Zeitlos's docs/app_runtime.md -- k_proc_create() is handed exactly
+ * fs_size(binary), no headroom reserved for later runtime malloc()
+ * growth beyond that), a large single runtime malloc() for the cell
+ * heap has no guarantee of the room it needs -- _sbrk() can only grow
+ * into memory the process was actually allocated up front. Declaring
+ * the heap as an ordinary static array instead makes its size part of
+ * the binary's own .bss, and therefore part of exactly what
+ * k_proc_create() ends up requesting -- deterministic, known at
+ * compile time, no dependency on how generously (or not) a given
+ * target's allocator rounds up an oversized runtime malloc().
+ * `lisp` (sw/apps/lisp/lisp.c) builds with this defined; nothing about
+ * this changes ms's own cons/GC code at all -- ms_heap/ms_freelist
+ * are still plain pointers as far as the rest of this file is
+ * concerned, just pointed at static storage instead of malloc'd
+ * storage in ms_init(), and never free()'d in ms_deinit() (freeing
+ * static storage isn't meaningful -- see below). */
+static ms_val ms_heap_storage[MS_HEAP_SIZE];
+static ms_val *ms_protect_stack_storage[MS_PROTECT_STACK_SIZE];
+#endif
+
 void ms_init(void) {
+#ifdef MS_STATIC_HEAP
+	if (!ms_heap) ms_heap = ms_heap_storage;
+	if (!ms_protect_stack) ms_protect_stack = ms_protect_stack_storage;
+#else
 	if (!ms_heap) ms_heap = malloc(MS_HEAP_SIZE * sizeof(ms_val));
 	if (!ms_protect_stack) ms_protect_stack = malloc(MS_PROTECT_STACK_SIZE * sizeof(ms_val *));
+#endif
 	ms_heap_live = 0;
 	ms_freelist = NULL;
 	for (long i = MS_HEAP_SIZE - 1; i >= 0; i--) {
@@ -2448,9 +2557,32 @@ void ms_init(void) {
 	env_define(ms_global_env, mk_sym("false"), g_false);
 }
 
+/* NOT part of upstream ms.c. Small read-only accessors for an
+ * embedder that wants to report memory usage (e.g. Zeitlos's `lisp`
+ * app's "free" command, sw/apps/lisp/lisp.c) without reaching into
+ * ms's own internals -- ms_heap_live is otherwise `static` (invisible
+ * outside this file), and sizeof(ms_val) is otherwise unknowable from
+ * outside since ms_val is deliberately kept opaque in
+ * sw/apps/lisp/ms_api.h. Both trivial, both just read a value that
+ * already exists -- no new state, no behavior change to anything
+ * else in this file. */
+long ms_heap_used(void) { return ms_heap_live; }
+size_t ms_cell_size(void) { return sizeof(ms_val); }
+
 void ms_deinit(void) {
+#ifdef MS_STATIC_HEAP
+	/* static storage -- nothing to free(); just drop the pointers so
+	 * a later ms_init() re-points them and re-runs its setup, same
+	 * as the malloc'd case re-mallocing on a NULL check. The RAM
+	 * itself was never reclaimable (it's part of `lisp`'s own fixed
+	 * process footprint regardless of whether ms is "in use" -- see
+	 * the MS_STATIC_HEAP comment above), unlike upstream's
+	 * malloc'd-heap case, where ms_deinit() genuinely does free real
+	 * memory back to the process's own heap. */
+#else
 	free(ms_heap);
 	free(ms_protect_stack);
+#endif
 	ms_heap = NULL;
 	ms_protect_stack = NULL;
 	ms_global_env = NULL;
