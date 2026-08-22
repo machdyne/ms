@@ -184,7 +184,13 @@ static int ms_wind_top = 0;
  * PROTOTYPES
  * ------------------------------------------------------------------- */
 
-static void ms_log(ms_log_level level, const char *fmt, ...);
+/* NOT static upstream -- exposed (alongside ms_log_level's own values,
+ * MS_INFO/MS_ERROR/MS_PANIC, already a plain non-static typedef) so
+ * an embedder-defined builtin (Zeitlos's sw/apps/repl/zapi.c) can
+ * raise a real Scheme error the same way every bi_* builtin above
+ * does, rather than inventing a second, inconsistent error-reporting
+ * convention just for embedder-added procedures. */
+void ms_log(ms_log_level level, const char *fmt, ...);
 static void ms_gc(void);
 static ms_val *alloc_cell(void);
 static ms_val *mk_num(double n);
@@ -230,6 +236,25 @@ void ms_deinit(void);	/* frees the heap/protect stack malloc'd by
 						 * ms_init(); not part of upstream ms.c -- added
 						 * so an embedding caller can reclaim this RAM
 						 * when the interpreter isn't in use */
+
+/* NOT part of upstream ms.c -- Zeitlos embedder-registration API, see
+ * the full explanation right above these functions' definitions
+ * (near ms_heap_used()/ms_cell_size() below). */
+void ms_def_builtin(const char *name, ms_builtin fn);
+bool ms_is_callable(const char *name);
+ms_val *ms_mk_str(char *owned);
+ms_val *ms_mk_num(double n);
+ms_val *ms_mk_bool(bool b);
+ms_val *ms_nil_val(void);
+ms_val *ms_mk_str_list(char **items, int count);
+bool ms_is_str(ms_val *v);
+bool ms_is_num(ms_val *v);
+bool ms_is_pair(ms_val *v);
+bool ms_is_nil(ms_val *v);
+const char *ms_str_val(ms_val *v);
+double ms_num_val(ms_val *v);
+ms_val *ms_car(ms_val *v);
+ms_val *ms_cdr(ms_val *v);
 
 /* opt-in panic recovery -- not part of upstream ms.c; see the full
  * explanation and correct usage pattern near ms_log() below. setjmp()
@@ -305,7 +330,7 @@ bool ms_exit_requested = false;	/* set by (exit) when longjmp'ing back
 									 * exiting -- see bi_exit() */
 int ms_exit_code = 0;
 
-static void ms_log(ms_log_level level, const char *fmt, ...) {
+void ms_log(ms_log_level level, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
 	if (level == MS_INFO) fprintf(stderr, "[info] ");
@@ -2568,6 +2593,86 @@ void ms_init(void) {
  * else in this file. */
 long ms_heap_used(void) { return ms_heap_live; }
 size_t ms_cell_size(void) { return sizeof(ms_val); }
+
+/* NOT part of upstream ms.c. Registration + return-value-construction
+ * API for an embedder (Zeitlos's sw/apps/repl/zapi.c -- see
+ * docs/scheme_api.md) that wants to add its OWN C-backed Scheme
+ * procedures without needing direct access to this file's own
+ * (otherwise `static`) mk_fun()/mk_sym()/env_define()/mk_str()/
+ * mk_num()/mk_pair(). One-time patch: everything an embedder adds
+ * AFTER this point is a plain C function of the same
+ * ms_val *(*)(ms_val *args) shape every bi_* builtin above already
+ * has, registered via ms_def_builtin() -- ms.c itself never needs
+ * touching again for a new procedure.
+ *
+ * The scalar constructors (ms_mk_str/_num/_bool, ms_nil_val) are safe
+ * to call directly and return immediately -- each is exactly one
+ * alloc_cell() call, no intermediate unprotected state between two
+ * allocations the way a hand-rolled multi-step construction could
+ * leave one exposed to a GC triggered by the next (see mk_pair()'s
+ * own PUSH/POP pattern for why THAT needs protecting and a single
+ * mk_str()/mk_num() call doesn't). Building anything bigger than one
+ * cell from outside this file goes through a ready-made composite
+ * constructor instead (ms_mk_str_list() below) rather than exposing
+ * PUSH/POP themselves -- keeps every embedder-side builtin from
+ * having to get GC-safety right by hand. */
+
+void ms_def_builtin(const char *name, ms_builtin fn) {
+	env_define(ms_global_env, mk_sym(name), mk_fun(fn));
+}
+
+/* true if `name` is currently bound to something callable (a builtin
+ * or a closure) in the global environment -- used by repl.c's
+ * bare-word command-syntax translation (docs/scheme_api.md \S1) to
+ * decide whether e.g. typing `ls` should become `(ls)` before
+ * evaluating. Interning a symbol just to check it costs the same
+ * small, one-time-per-unique-name amount typing that name normally
+ * would already pay (mk_sym() below) -- nothing new. */
+bool ms_is_callable(const char *name) {
+	ms_val *v = env_lookup(ms_global_env, mk_sym(name));
+	return v && (v->type == T_FUN || v->type == T_LAMBDA);
+}
+
+ms_val *ms_mk_str(char *owned) { return mk_str(owned); } /* takes ownership */
+ms_val *ms_mk_num(double n) { return mk_num(n); }
+ms_val *ms_mk_bool(bool b) { return b ? g_true : g_false; }
+ms_val *ms_nil_val(void) { return g_nil; }
+
+/* builds a proper Scheme list of strings from a plain C array --
+ * takes ownership of every string in `items` (same convention
+ * ms_mk_str() uses), same as if the caller had called ms_mk_str() on
+ * each one and consed them together itself, just without needing
+ * this file's own (otherwise static) PUSH/POP to stay GC-safe across
+ * the several allocations that takes. Safe for count == 0 (returns
+ * the empty list). */
+/* type/value accessors for embedder-defined builtins -- ms_val stays
+ * fully opaque (see ms_api.h's own comment on why), these are the
+ * ONLY way a zapi_* function can inspect its own arguments. Pure
+ * reads, no allocation -- always safe to call, nothing GC-related to
+ * think about. */
+bool ms_is_str(ms_val *v) { return v && v->type == T_STR; }
+bool ms_is_num(ms_val *v) { return v && v->type == T_NUM; }
+bool ms_is_pair(ms_val *v) { return v && v->type == T_PAIR; }
+bool ms_is_nil(ms_val *v) { return nilp(v); }
+const char *ms_str_val(ms_val *v) { return v->u.str; }
+double ms_num_val(ms_val *v) { return v->u.num; }
+ms_val *ms_car(ms_val *v) { return pcar(v); }
+ms_val *ms_cdr(ms_val *v) { return pcdr(v); }
+
+ms_val *ms_mk_str_list(char **items, int count) {
+	ms_val *head = g_nil;
+	PUSH(head);
+	for (int i = count - 1; i >= 0; i--) {
+		ms_val *s = mk_str(items[i]);
+		PUSH(s);
+		ms_val *cell = mk_pair(s, head);
+		POP();
+		head = cell;
+		ms_protect_stack[ms_protect_top - 1] = head;
+	}
+	POP();
+	return head;
+}
 
 void ms_deinit(void) {
 #ifdef MS_STATIC_HEAP
