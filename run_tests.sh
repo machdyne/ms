@@ -76,7 +76,7 @@ expect_failure() {
 
 build "default (desktop) build"
 
-for f in test_core.l test_lists.l test_closures.l test_r4rs.l test_strings.l; do
+for f in test_core.l test_lists.l test_closures.l test_r4rs.l test_strings.l test_macros.l; do
 	run_lisp_test "$f"
 done
 

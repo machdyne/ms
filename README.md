@@ -221,7 +221,9 @@ drops the same features for the same reasons.
   These were an *optional* appendix in R4RS (not required for a
   conforming "core" implementation), and hygiene is enough of an
   engineering project on its own that it isn't included here. Ordinary
-  procedures cover most of what you'd reach for a macro for.
+  procedures cover most of what you'd reach for a macro for, and the
+  traditional non-hygienic `define-macro` is there for the rest (see
+  [Built-in functions](#built-in-functions-and-special-forms)).
 - **Full (re-entrant, multi-shot) continuations.** `call/cc` here is
   implemented with `setjmp`/`longjmp`: it can escape outward to an
   enclosing `call/cc` (early return, exception-like unwinding, `for-each`
@@ -486,6 +488,25 @@ after the jump, with the requested code in `ms_exit_code`), so a
 user's `(exit)` call ends their Scheme session rather than your whole
 embedding process.
 
+### Hooks: messages and stopping
+
+```c
+extern void (*ms_log_hook)(int level, const char *msg);   /* level: MS_INFO, MS_ERROR, MS_PANIC */
+extern bool (*ms_step_hook)(void);
+```
+
+`ms_log_hook`, when set, receives every message `ms_log()` would print
+-- errors, panics -- instead of stderr, formatted and without the
+`[error] ` prefix: an app with no console shows them where its user is
+looking. A panic still unwinds to `ms_panic_recovery` afterwards.
+
+`ms_step_hook`, when set, is called every `MS_STEP_EVERY` evaluations
+(2048 by default). If it returns true, evaluation stops with a panic,
+`stopped`, which your `ms_panic_recovery` catches. That is how a
+program caught in `(while #t)` is stopped from the keyboard: the hook
+looks at the app's input without blocking (and can keep it responsive
+meanwhile). It costs one compare per evaluation when unset.
+
 ### Introspection
 
 ```c
@@ -541,7 +562,24 @@ unquote and `,@` unquote-splicing), `if`, `cond` (with `else` and `=>`),
 `case` (with `else`), `begin`, `and`, `or` (both short-circuiting,
 variadic), `while`, `lambda`, `let`, named `let`, `let*`, `letrec`,
 `do`, `set!`, `define` (value or `(define (name args...) body)`
-shorthand), `defun`, `delay`.
+shorthand), `defun`, `delay`, `define-macro`.
+
+**`define-macro`** is the traditional (non-hygienic) Lisp macro: a
+procedure called with its arguments *as written*, whose result -- a new
+form, usually built with quasiquote -- is evaluated in the caller's
+place, in tail position:
+
+```scheme
+(define-macro (after ms . body) `(set-timer ,ms (lambda () ,@body)))
+(after 500 (display "hi"))          ; no lambda for the caller to write
+(macroexpand-1 '(after 500 (go)))   ; => (set-timer 500 (lambda () (go)))
+```
+
+It exists so that an embedder can offer short forms to people who will
+never write a `lambda`. It is not hygienic: names the expansion
+introduces can meet the caller's, so give a macro's own helpers unusual
+names. A macro is not a procedure (`procedure?` is `#f`) and cannot be
+passed to `map` or `apply`.
 
 **Built-in procedures:**
 - Pairs/lists: `car`, `cdr`, `cons`, `set-car!`, `set-cdr!`, `list`,
@@ -594,13 +632,14 @@ make test
 runs, in order:
 
 1. **In-language tests** (`test_core.l`, `test_lists.l`,
-   `test_closures.l`, `test_r4rs.l`, `test_strings.l`) -- a small
+   `test_closures.l`, `test_r4rs.l`, `test_strings.l`,
+   `test_macros.l`) -- a small
    `check`/`report` harness (`harness.l`) exercising arithmetic,
    equality, every special form, closures, tail recursion correctness,
    R4RS truthiness, booleans/characters/vectors, `letrec`/named-`let`/
    `do`/`case`, `delay`/`force`, `call/cc`/`dynamic-wind` (including the
    escape-through-dynamic-wind interaction), list/string/vector library
-   functions, and quasiquote. 252 checks in total.
+   functions, quasiquote, and `define-macro` (with `macroexpand-1`).
 2. **GC-under-pressure**: a tail-recursive loop of 5,000,000 iterations
    against a 1000-cell heap, which only succeeds if garbage (stale
    per-iteration environments and numbers) is actually being reclaimed.

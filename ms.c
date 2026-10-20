@@ -109,7 +109,10 @@ typedef enum {
 	T_FUN,       /* builtin C function */
 	T_LAMBDA,    /* user-defined closure */
 	T_PROMISE,   /* delay/force */
-	T_CONT       /* an escape-only continuation captured by call/cc */
+	T_CONT,      /* an escape-only continuation captured by call/cc */
+	T_MACRO      /* define-macro: a closure called with its arguments
+	              * unevaluated, whose result is then evaluated in the
+	              * caller's place (u.lambda, like T_LAMBDA) */
 } ms_type;
 
 typedef struct ms_cont_data {
@@ -132,7 +135,7 @@ struct ms_val {
 		struct { ms_val *car, *cdr; } pair;   /* T_PAIR */
 		struct { ms_val **items; long len; } vec; /* T_VECTOR (owns items) */
 		ms_builtin fn;               /* T_FUN */
-		struct { ms_val *params, *body, *env; } lambda; /* T_LAMBDA */
+		struct { ms_val *params, *body, *env; } lambda; /* T_LAMBDA, T_MACRO */
 		struct { bool forced; ms_val *value; ms_val *thunk; } promise; /* T_PROMISE */
 		ms_cont_data *cont;          /* T_CONT (owns the ms_cont_data) */
 	} u;
@@ -161,7 +164,8 @@ static ms_val *g_eof;        /* end-of-file object */
 static ms_val *sym_quote, *sym_if, *sym_cond, *sym_begin, *sym_lambda,
 	*sym_define, *sym_defun, *sym_let, *sym_letstar, *sym_letrec, *sym_set,
 	*sym_and, *sym_or, *sym_while, *sym_quasiquote, *sym_unquote,
-	*sym_unquote_splicing, *sym_do, *sym_case, *sym_delay, *sym_else, *sym_arrow;
+	*sym_unquote_splicing, *sym_do, *sym_case, *sym_delay, *sym_else, *sym_arrow,
+	*sym_define_macro;
 
 ms_val *ms_global_env;
 
@@ -191,6 +195,8 @@ static int ms_wind_top = 0;
  * does, rather than inventing a second, inconsistent error-reporting
  * convention just for embedder-added procedures. */
 void ms_log(ms_log_level level, const char *fmt, ...);
+extern void (*ms_log_hook)(int level, const char *msg);	/* level: an ms_log_level */
+extern bool (*ms_step_hook)(void);
 static void ms_gc(void);
 static ms_val *alloc_cell(void);
 static ms_val *mk_num(double n);
@@ -330,9 +336,38 @@ bool ms_exit_requested = false;	/* set by (exit) when longjmp'ing back
 									 * exiting -- see bi_exit() */
 int ms_exit_code = 0;
 
+/* Embedder hooks (not part of upstream ms.c):
+ *
+ * ms_log_hook, when set, receives every message ms_log() would print
+ * (formatted, without the "[error] " prefix) instead of stderr -- an
+ * app with no console shows them where its user looks.
+ *
+ * ms_step_hook, when set, is called every MS_STEP_EVERY evaluations; if
+ * it returns true the evaluation stops with a panic ("stopped"), which
+ * the embedder's ms_panic_recovery catches. That is how a program
+ * stuck in a loop is stopped from the keyboard: the hook looks at the
+ * app's input without blocking. */
+#ifndef MS_STEP_EVERY
+#define MS_STEP_EVERY 2048
+#endif
+void (*ms_log_hook)(int level, const char *msg) = NULL;
+bool (*ms_step_hook)(void) = NULL;
+static unsigned ms_step_count;
+
 void ms_log(ms_log_level level, const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
+	if (ms_log_hook) {
+		char m[200];
+		vsnprintf(m, sizeof(m), fmt, args);
+		va_end(args);
+		ms_log_hook((int)level, m);
+		if (level == MS_PANIC) {
+			if (ms_panic_recovery_armed) longjmp(ms_panic_recovery, 1);
+			exit(EXIT_FAILURE);
+		}
+		return;
+	}
 	if (level == MS_INFO) fprintf(stderr, "[info] ");
 	else if (level == MS_ERROR) fprintf(stderr, "[error] ");
 	else if (level == MS_PANIC) fprintf(stderr, "[panic] ");
@@ -388,6 +423,7 @@ static void gc_mark(ms_val *v) {
 			gc_mark(v->u.pair.cdr);
 			break;
 		case T_LAMBDA:
+		case T_MACRO:
 			gc_mark(v->u.lambda.params);
 			gc_mark(v->u.lambda.body);
 			gc_mark(v->u.lambda.env);
@@ -811,6 +847,7 @@ static void ms_print_inner(ms_val *v, bool readable) {
 			break;
 		case T_FUN: printf("#<builtin>"); break;
 		case T_LAMBDA: printf("#<procedure>"); break;
+		case T_MACRO: printf("#<macro>"); break;
 		case T_PROMISE: printf("#<promise>"); break;
 		case T_CONT: printf("#<continuation>"); break;
 		case T_VECTOR: {
@@ -885,6 +922,7 @@ static void tostr_inner(ms_val *v, bool readable, char **buf, size_t *len, size_
 			break;
 		case T_FUN: tostr_append(buf, len, cap, "#<builtin>"); break;
 		case T_LAMBDA: tostr_append(buf, len, cap, "#<procedure>"); break;
+		case T_MACRO: tostr_append(buf, len, cap, "#<macro>"); break;
 		case T_PROMISE: tostr_append(buf, len, cap, "#<promise>"); break;
 		case T_CONT: tostr_append(buf, len, cap, "#<continuation>"); break;
 		case T_VECTOR: {
@@ -1186,11 +1224,15 @@ ms_val *ms_eval(ms_val *x, ms_val *env) {
 tail_call:
 	ms_protect_stack[ms_protect_top - 2] = x;
 	ms_protect_stack[ms_protect_top - 1] = env;
+	if (ms_step_hook && ++ms_step_count >= MS_STEP_EVERY) {
+		ms_step_count = 0;
+		if (ms_step_hook()) ms_log(MS_PANIC, "stopped");
+	}
 
 	if (x == NULL || x->type == T_NIL || x->type == T_NUM || x->type == T_STR ||
 		x->type == T_BOOL || x->type == T_CHAR || x->type == T_VECTOR ||
 		x->type == T_FUN || x->type == T_LAMBDA || x->type == T_PROMISE ||
-		x->type == T_CONT) {
+		x->type == T_CONT || x->type == T_MACRO) {
 		POPN(2);
 		return x;
 	}
@@ -1506,6 +1548,28 @@ tail_call:
 			return name;
 		}
 
+		if (op == sym_define_macro) {
+			/* (define-macro (name . params) body...): a closure, marked
+			 * as a macro -- see the T_MACRO case of application below */
+			ms_val *target = pcar(args);
+			if (target->type != T_PAIR || pcar(target)->type != T_SYM) {
+				ms_log(MS_ERROR, "define-macro: (define-macro (name args...) body...)");
+				POPN(2);
+				return g_false;
+			}
+			{
+				ms_val *name = pcar(target);
+				ms_val *m;
+				PUSH(name);
+				m = mk_lambda(pcdr(target), pcdr(args), env);
+				m->type = T_MACRO;
+				PUSH(m);
+				env_define(env, name, m);
+				POPN(4);
+				return name;
+			}
+		}
+
 		if (op == sym_quasiquote) {
 			/* minimal quasiquote: supports ,x and ,@x at any depth-1 position */
 			ms_val *tmpl = pcar(args);
@@ -1522,6 +1586,20 @@ tail_call:
 	 * `((lambda (x) x) 5)`. */
 	ms_val *f = ms_eval(op, env);
 	PUSH(f);
+	if (f->type == T_MACRO) {
+		/* a macro: its parameters bound to the forms as written, its
+		 * body run to make a new form, and that evaluated here, in
+		 * the caller's environment (a tail position, like any call).
+		 * Not hygienic: a macro's own names can meet the caller's --
+		 * give helpers unusual names. */
+		ms_val *menv = bind_params(f->u.lambda.params, args, f->u.lambda.env);
+		ms_val *form;
+		PUSH(menv);
+		form = ms_eval(eval_body(f->u.lambda.body, menv), menv);
+		POPN(2);
+		x = form;
+		goto tail_call;
+	}
 	ms_val *argv = eval_list(args, env);
 	PUSH(argv);
 
@@ -1720,6 +1798,21 @@ static ms_val *bi_sym_p(ms_val *args) { return ARG1->type == T_SYM ? g_true : g_
 static ms_val *bi_bool_p(ms_val *args) { return ARG1->type == T_BOOL ? g_true : g_false; }
 static ms_val *bi_char_p(ms_val *args) { return ARG1->type == T_CHAR ? g_true : g_false; }
 static ms_val *bi_vector_p(ms_val *args) { return ARG1->type == T_VECTOR ? g_true : g_false; }
+/* (macroexpand-1 form): what a macro call turns into, once -- for
+ * looking at a macro; anything else comes back as it is */
+static ms_val *bi_macroexpand_1(ms_val *args) {
+	ms_val *form = ARG1, *m, *menv, *r;
+	if (form->type != T_PAIR || pcar(form)->type != T_SYM) return form;
+	m = env_lookup(ms_global_env, pcar(form));
+	if (!m || m->type != T_MACRO) return form;
+	PUSH(form); PUSH(m);
+	menv = bind_params(m->u.lambda.params, pcdr(form), m->u.lambda.env);
+	PUSH(menv);
+	r = ms_eval(eval_body(m->u.lambda.body, menv), menv);
+	POPN(3);
+	return r;
+}
+
 static ms_val *bi_proc_p(ms_val *args) {
 	ms_val *x = ARG1;
 	return (x->type == T_FUN || x->type == T_LAMBDA || x->type == T_CONT) ? g_true : g_false;
@@ -2354,6 +2447,7 @@ ms_val *ms_env_std(void) {
 	def_builtin(env, "char?", bi_char_p);
 	def_builtin(env, "vector?", bi_vector_p);
 	def_builtin(env, "procedure?", bi_proc_p);
+	def_builtin(env, "macroexpand-1", bi_macroexpand_1);
 	def_builtin(env, "eof-object?", bi_eof_object_p);
 	def_builtin(env, "length", bi_length);
 
@@ -2559,6 +2653,7 @@ void ms_init(void) {
 	sym_lambda = mk_sym("lambda");
 	sym_define = mk_sym("define");
 	sym_defun = mk_sym("defun");
+	sym_define_macro = mk_sym("define-macro");
 	sym_let = mk_sym("let");
 	sym_letstar = mk_sym("let*");
 	sym_letrec = mk_sym("letrec");
