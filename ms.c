@@ -571,13 +571,52 @@ static ms_val *mk_promise(ms_val *thunk) {
 	return v;
 }
 
+/* Lookup tables: finding a symbol by name, and a global binding by
+ * symbol, would otherwise be walks along lists of every symbol and every
+ * global -- hundreds long once a library is loaded, and the top of an
+ * embedder's profile when a program makes thousands of global lookups.
+ * Both tables only point at cells that are never freed: every symbol is
+ * kept by ms_symbols, a GC root, and every global binding by the global
+ * frame. A table that fills up is dropped and the lists are walked
+ * instead; ms_init() clears both. */
+#ifndef MS_HASH_SIZE
+#define MS_HASH_SIZE 2048		/* a power of two; 16 KB of pointers here */
+#endif
+static ms_val *sym_hash[MS_HASH_SIZE];
+static int sym_hash_n;
+static bool sym_hash_off;
+static ms_val *ghash_key[MS_HASH_SIZE], *ghash_bind[MS_HASH_SIZE];
+static int ghash_n;
+static ms_val *ghash_env;		/* the env whose top frame is in the table, NULL none */
+static bool ghash_full;			/* it did not fit: walk the list, and stop trying */
+
+static unsigned name_hash(const char *s) {
+	unsigned h = 2166136261u;
+	while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+	return h & (MS_HASH_SIZE - 1);
+}
+
+static unsigned ptr_hash(const ms_val *p) {
+	unsigned long v = (unsigned long)p;
+	v ^= v >> 9;
+	return (unsigned)(v * 2654435761u) & (MS_HASH_SIZE - 1);
+}
+
 /* interned symbols: identical names share one cell, so `eq?` on symbols
  * is a pointer comparison, and special forms can be recognized by
  * comparing against the fixed sym_* pointers. */
 static ms_val *mk_sym(const char *name) {
-	for (ms_val *p = ms_symbols; p != NULL && p->type == T_PAIR; p = p->u.pair.cdr) {
-		ms_val *s = p->u.pair.car;
-		if (strcmp(s->u.str, name) == 0) return s;
+	unsigned i = name_hash(name);
+	if (!sym_hash_off) {
+		while (sym_hash[i]) {
+			if (strcmp(sym_hash[i]->u.str, name) == 0) return sym_hash[i];
+			i = (i + 1) & (MS_HASH_SIZE - 1);
+		}
+	} else {
+		for (ms_val *p = ms_symbols; p != NULL && p->type == T_PAIR; p = p->u.pair.cdr) {
+			ms_val *s = p->u.pair.car;
+			if (strcmp(s->u.str, name) == 0) return s;
+		}
 	}
 	ms_val *v = alloc_cell();
 	v->type = T_SYM;
@@ -586,7 +625,46 @@ static ms_val *mk_sym(const char *name) {
 	PUSH(v);
 	ms_symbols = mk_pair(v, ms_symbols);
 	POP();
+	if (!sym_hash_off) {
+		if (sym_hash_n * 4 >= MS_HASH_SIZE * 3) sym_hash_off = true;	/* full: the list from now on */
+		else { sym_hash[i] = v; sym_hash_n++; }
+	}
 	return v;
+}
+
+/* the binding of sym in the hashed frame; *found false if it has none */
+static ms_val *ghash_find(ms_val *sym) {
+	unsigned i = ptr_hash(sym);
+	while (ghash_key[i]) {
+		if (ghash_key[i] == sym) return ghash_bind[i];
+		i = (i + 1) & (MS_HASH_SIZE - 1);
+	}
+	return NULL;
+}
+
+static void ghash_put(ms_val *sym, ms_val *binding) {
+	unsigned i = ptr_hash(sym);
+	while (ghash_key[i] && ghash_key[i] != sym) i = (i + 1) & (MS_HASH_SIZE - 1);
+	if (!ghash_key[i]) {
+		if (ghash_n * 4 >= MS_HASH_SIZE * 3) { ghash_env = NULL; ghash_full = true; return; }	/* full: walk instead */
+		ghash_n++;
+	}
+	ghash_key[i] = sym;
+	ghash_bind[i] = binding;
+}
+
+/* the global frame into the table, the newest binding of each name */
+static bool ghash_ready(ms_val *env) {
+	if (ghash_env == env) return true;
+	if (ghash_full) return false;
+	memset(ghash_key, 0, sizeof ghash_key);
+	ghash_n = 0;
+	ghash_env = env;
+	for (ms_val *f = env->u.pair.car; f && f->type == T_PAIR && ghash_env; f = f->u.pair.cdr) {
+		ms_val *b = f->u.pair.car;
+		if (!ghash_find(b->u.pair.car)) ghash_put(b->u.pair.car, b);
+	}
+	return ghash_env == env;
 }
 
 /* ----------------------------------------------------------------------
@@ -675,6 +753,10 @@ static ms_val *ms_new_env(ms_val *parent) {
 
 static ms_val *env_lookup(ms_val *env, ms_val *sym) {
 	while (env && env->type == T_PAIR) {
+		if (env == ms_global_env && ms_global_env && ghash_ready(env)) {
+			ms_val *b = ghash_find(sym);
+			return b ? b->u.pair.cdr : NULL;
+		}
 		ms_val *frame = env->u.pair.car;
 		while (frame && frame->type == T_PAIR) {
 			ms_val *binding = frame->u.pair.car;
@@ -691,6 +773,7 @@ static void env_define(ms_val *env, ms_val *sym, ms_val *val) {
 	ms_val *binding = mk_pair(sym, val);
 	PUSH(binding);
 	env->u.pair.car = mk_pair(binding, env->u.pair.car);
+	if (env == ghash_env) ghash_put(sym, binding);
 	POPN(4);
 }
 
@@ -699,6 +782,11 @@ static void env_define(ms_val *env, ms_val *sym, ms_val *val) {
 static bool env_set(ms_val *env, ms_val *sym, ms_val *val) {
 	ms_val *e = env;
 	while (e && e->type == T_PAIR) {
+		if (e == ms_global_env && ghash_ready(e)) {
+			ms_val *b = ghash_find(sym);
+			if (b) { b->u.pair.cdr = val; return true; }
+			break;
+		}
 		ms_val *frame = e->u.pair.car;
 		while (frame && frame->type == T_PAIR) {
 			ms_val *binding = frame->u.pair.car;
@@ -2622,6 +2710,11 @@ void ms_init(void) {
 	ms_symbols = NULL;
 	ms_protect_top = 0;
 	ms_wind_top = 0;
+	memset(sym_hash, 0, sizeof sym_hash);
+	sym_hash_n = 0;
+	sym_hash_off = false;
+	ghash_env = NULL;
+	ghash_full = false;
 
 	/* g_nil/g_true/g_false/g_unassigned/g_eof are permanent singletons;
 	 * protect them forever by pushing them at the bottom of the protect
