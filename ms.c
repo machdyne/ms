@@ -1367,6 +1367,7 @@ tail_call:
 				env_define(newenv, name, fn);
 				POPN(4);
 				env = newenv;
+				ms_protect_stack[ms_protect_top - 1] = env;	/* this frame's env slot: newenv is kept while its body runs */
 				x = eval_body(body, env);
 				goto tail_call;
 			}
@@ -1384,6 +1385,7 @@ tail_call:
 			}
 			POPN(3);
 			env = newenv;
+			ms_protect_stack[ms_protect_top - 1] = env;	/* this frame's env slot: newenv is kept while its body runs */
 			x = eval_body(body, env);
 			goto tail_call;
 		}
@@ -1403,6 +1405,7 @@ tail_call:
 			}
 			POPN(3);
 			env = newenv;
+			ms_protect_stack[ms_protect_top - 1] = env;	/* this frame's env slot: newenv is kept while its body runs */
 			x = eval_body(body, env);
 			goto tail_call;
 		}
@@ -1427,6 +1430,7 @@ tail_call:
 			}
 			POPN(3);
 			env = newenv;
+			ms_protect_stack[ms_protect_top - 1] = env;	/* this frame's env slot: newenv is kept while its body runs */
 			x = eval_body(body, env);
 			goto tail_call;
 		}
@@ -1628,6 +1632,7 @@ tail_call:
 		ms_val *body = f->u.lambda.body;
 		POPN(2); /* drop f, argv only -- keep this frame's x/env slots for goto */
 		env = newenv;
+		ms_protect_stack[ms_protect_top - 1] = env;	/* this frame's env slot: newenv is kept while its body runs */
 		x = eval_body(body, env);
 		goto tail_call;
 	}
