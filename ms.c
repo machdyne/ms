@@ -2712,7 +2712,28 @@ static ms_val ms_heap_storage[MS_HEAP_SIZE];
 static ms_val *ms_protect_stack_storage[MS_PROTECT_STACK_SIZE];
 #endif
 
+/* True while ms_heap holds cells laid out by ms_init(). */
+static bool ms_cells_valid;
+
+/* Frees what live cells own outside the heap -- strings, symbol names,
+ * vectors, continuations -- as the sweep does for dead ones. For a
+ * re-init without ms_deinit() (learn restarts its Scheme every few
+ * figures that way) and for ms_deinit(): before this, every restart
+ * leaked the names of every symbol and string still alive. */
+static void release_cells(void) {
+	if (!ms_cells_valid || !ms_heap) return;
+	for (long i = 0; i < MS_HEAP_SIZE; i++) {
+		ms_val *c = &ms_heap[i];
+		if (c->type == T_STR || c->type == T_SYM) free(c->u.str);
+		else if (c->type == T_VECTOR) free(c->u.vec.items);
+		else if (c->type == T_CONT) free(c->u.cont);
+		c->type = T_FREE;
+	}
+	ms_cells_valid = false;
+}
+
 void ms_init(void) {
+	release_cells();
 #ifdef MS_STATIC_HEAP
 	if (!ms_heap) ms_heap = ms_heap_storage;
 	if (!ms_protect_stack) ms_protect_stack = ms_protect_stack_storage;
@@ -2727,6 +2748,7 @@ void ms_init(void) {
 		ms_heap[i].u.pair.cdr = ms_freelist;
 		ms_freelist = &ms_heap[i];
 	}
+	ms_cells_valid = true;
 	ms_symbols = NULL;
 	ms_protect_top = 0;
 	ms_wind_top = 0;
@@ -2890,6 +2912,7 @@ ms_val *ms_mk_str_list(char **items, int count) {
 }
 
 void ms_deinit(void) {
+	release_cells();
 #ifdef MS_STATIC_HEAP
 	/* static storage -- nothing to free(); just drop the pointers so
 	 * a later ms_init() re-points them and re-runs its setup, same
